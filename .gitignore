@@ -1,0 +1,20 @@
+# general
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS (Windows/Mac)
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# local & env
+*.log
+.env
