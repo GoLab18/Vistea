@@ -10,6 +10,8 @@ from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision import drawing_utils
 from mediapipe.tasks.python.vision import drawing_styles
 
+from core.filters import PointFilter, OneEuroFilter
+
 MODEL_DIR: Final[str] = "models"
 MODEL_NAME: Final[str] = "face_landmarker.task"
 MODEL_URL: Final[str] = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
@@ -22,8 +24,7 @@ class LandmarksData:
     blendshapes: Optional[Any] = None
 
 class GazeEstimator:
-    # Alpha = 0.5 -> moderate smoothing (50% new frame, 50% old frame)
-    def __init__(self, alpha: float = 0.5):
+    def __init__(self, left_filter: Optional[PointFilter] = None, right_filter: Optional[PointFilter] = None):
         self.model_path = os.path.join(MODEL_DIR, MODEL_NAME)
         self._ensure_model_exists()
 
@@ -39,9 +40,8 @@ class GazeEstimator:
         
         self.landmarker = vision.FaceLandmarker.create_from_options(options)
         
-        self.alpha = alpha
-        self._prev_left_iris: Optional[Tuple[float, float]] = None
-        self._prev_right_iris: Optional[Tuple[float, float]] = None
+        self.left_filter = left_filter if left_filter else OneEuroFilter()
+        self.right_filter = right_filter if right_filter else OneEuroFilter()
 
     def _ensure_model_exists(self):
         if not os.path.exists(MODEL_DIR):
@@ -51,15 +51,6 @@ class GazeEstimator:
             print(f"Missing {MODEL_NAME}. Downloading...")
             urllib.request.urlretrieve(MODEL_URL, self.model_path)
             print("Model downloaded successfully.")
-
-    def _apply_ema(self, current: Tuple[int, int], previous: Optional[Tuple[float, float]]) -> Tuple[float, float]:
-        if previous is None:
-            return float(current[0]), float(current[1])
-        
-        return (
-            current[0] * self.alpha + previous[0] * (1.0 - self.alpha),
-            current[1] * self.alpha + previous[1] * (1.0 - self.alpha)
-        )
 
     def process_frame(self, frame: np.ndarray, timestamp_ms: int) -> Tuple[np.ndarray, LandmarksData]:
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -79,21 +70,19 @@ class GazeEstimator:
             face_landmarks = detection_result.face_landmarks[0]
             h, w, _ = frame.shape
             
-            # Extracts raw left iris coordinates
+            # Raw iris coordinates extraction
             raw_l_x = int(face_landmarks[473].x * w)
             raw_l_y = int(face_landmarks[473].y * h)
             
-            # Extracts raw right iris coordinates
             raw_r_x = int(face_landmarks[468].x * w)
             raw_r_y = int(face_landmarks[468].y * h)
             
-            # Exponential Moving Average filter
-            self._prev_left_iris = self._apply_ema((raw_l_x, raw_l_y), self._prev_left_iris)
-            self._prev_right_iris = self._apply_ema((raw_r_x, raw_r_y), self._prev_right_iris)
+            smoothed_left = self.left_filter.filter((raw_l_x, raw_l_y), timestamp_ms)
+            smoothed_right = self.right_filter.filter((raw_r_x, raw_r_y), timestamp_ms)
             
-            # Casts smoothed floats back to integers for UI usage
-            landmarks_data.left_iris = (int(self._prev_left_iris[0]), int(self._prev_left_iris[1]))
-            landmarks_data.right_iris = (int(self._prev_right_iris[0]), int(self._prev_right_iris[1]))
+            # Casting back to integers for UI usage
+            landmarks_data.left_iris = (int(smoothed_left[0]), int(smoothed_left[1]))
+            landmarks_data.right_iris = (int(smoothed_right[0]), int(smoothed_right[1]))
 
             drawing_utils.draw_landmarks(
                 image=annotated_image,
@@ -124,7 +113,6 @@ class GazeEstimator:
                 connection_drawing_spec=drawing_styles.get_default_face_mesh_iris_connections_style()
             )
             
-            # Draws solid yellow circles over the filtered coordinates to visualize stability
             cv2.circle(annotated_image, landmarks_data.left_iris, 4, (0, 255, 255), -1)
             cv2.circle(annotated_image, landmarks_data.right_iris, 4, (0, 255, 255), -1)
                 
