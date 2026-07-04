@@ -211,6 +211,72 @@ class HomographyCalibration:
         self._h = None
 
 
+class SmoothPursuitCalibration:
+    """
+    Pursuit Calibration (Pfeuffer et al., UIST 2013).
+    Dynamic strategy for dense planar coverage using smooth pursuit.
+    The UI hook for continuous sample collection is left to be implemented.
+    """
+    
+    name = "smooth_pursuit_60pt"
+
+    def __init__(self, alpha: float = 1e-3, degree: int = 2):
+        self._targets = self._generate_lissajous(60)
+        self._store = _SampleStore()
+        self._model = make_pipeline(
+            PolynomialFeatures(degree=degree, include_bias=False),
+            Ridge(alpha=alpha)
+        )
+        self._trained = False
+        # Compensate for natural oculomotor delay (approx. 150ms at 30 FPS)
+        self.delay_frames = 5 
+
+    def _generate_lissajous(self, n_points: int) -> List[NormalizedPoint]:
+        import math
+        pts = []
+        for i in range(n_points):
+            t = (i / max(1, n_points - 1)) * 2 * math.pi
+            x = 0.5 + 0.4 * math.sin(3 * t)
+            y = 0.5 + 0.4 * math.sin(2 * t)
+            pts.append(NormalizedPoint(x, y))
+        return pts
+
+    def target_sequence(self) -> List[NormalizedPoint]:
+        return list(self._targets)
+
+    def add_samples(self, target: NormalizedPoint, features_batch: List[FeatureVector]) -> None:
+        self._store.add(target, features_batch)
+
+    def train(self) -> None:
+        x, y = self._store.matrices()
+        if len(x) == 0:
+            raise ValueError("No calibration samples collected.")
+            
+        # Delay compensation: shift features relative to target labels
+        if len(x) > self.delay_frames:
+            x = x[:-self.delay_frames]
+            y = y[self.delay_frames:]
+            
+        self._model.fit(x, y)
+        self._trained = True
+
+    def is_calibrated(self) -> bool:
+        return self._trained
+
+    def predict(self, features: FeatureVector) -> Optional[NormalizedPoint]:
+        if not self._trained:
+            return None
+        pred = self._model.predict(np.asarray(features, dtype=float).reshape(1, -1))[0]
+        return NormalizedPoint(
+            float(np.clip(pred[0], 0.0, 1.0)),
+            float(np.clip(pred[1], 0.0, 1.0)),
+        )
+
+    def reset(self) -> None:
+        self._store.clear()
+        self._trained = False
+
+
 def _set_name(strategy: CalibrationStrategy, name: str) -> CalibrationStrategy:
     """Helper to cleanly override the strategy name for logging purposes."""
 
@@ -226,4 +292,5 @@ STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
     DEFAULT_STRATEGY_KEY: lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(3)), "ridge_poly2_9pt"),
     "Ridge 16-pt": lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(4)), "ridge_poly2_16pt"),
     "Homography (9-pt)": lambda: _set_name(HomographyCalibration(grid=make_grid(3)), "homography_9pt"),
+    "Smooth Pursuit (60-pt)": lambda: SmoothPursuitCalibration(),
 }
