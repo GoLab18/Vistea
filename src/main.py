@@ -33,14 +33,15 @@ from core.evaluation import ValidationReport, compute_point_error
 # At ~30 FPS this is roughly one second of fixation per point.
 SAMPLES_PER_POINT = 25
 
-# Validation targets intentionally lie OFF the training grid, so the report
-# measures generalization instead of memorization.
+# Validation targets intentionally lie OFF all training grids (5, 9, and 16-pt), 
+# so the report measures pure generalization instead of memorization.
 VALIDATION_TARGETS = [
-    NormalizedPoint(0.3, 0.3),
-    NormalizedPoint(0.7, 0.3),
-    NormalizedPoint(0.5, 0.5),
-    NormalizedPoint(0.3, 0.7),
-    NormalizedPoint(0.7, 0.7),
+    NormalizedPoint(0.2, 0.2),
+    NormalizedPoint(0.8, 0.2),
+    NormalizedPoint(0.2, 0.8),
+    NormalizedPoint(0.8, 0.8),
+    NormalizedPoint(0.35, 0.65),
+    NormalizedPoint(0.65, 0.35),
 ]
 
 
