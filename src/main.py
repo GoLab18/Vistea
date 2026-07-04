@@ -1,5 +1,6 @@
 import sys
 import time
+import logging
 from enum import Enum, auto
 from typing import List, Optional
 
@@ -32,6 +33,10 @@ from core.evaluation import ValidationReport, compute_point_error
 # Number of valid (non-blink) frames captured per calibration target.
 # At ~30 FPS this is roughly one second of fixation per point.
 SAMPLES_PER_POINT = 25
+
+# Quality gating threshold: maximum acceptable dispersion (spread) 
+# for a collected batch. Above this threshold, the batch is rejected.
+SPREAD_THRESHOLD = 0.006
 
 # Validation targets intentionally lie OFF all training grids (5, 9, and 16-pt), 
 # so the report measures pure generalization instead of memorization.
@@ -103,6 +108,7 @@ class CalibrationOverlay(QWidget):
         self.phase = Phase.CALIBRATION
         self.targets: List[NormalizedPoint] = strategy.target_sequence()
         self.current_idx = 0
+        self.retries = 0
         self.collecting = False
         self.batch: List[List[float]] = []
         self.validation_predictions: List[List[float]] = []
@@ -123,15 +129,39 @@ class CalibrationOverlay(QWidget):
         self.update()
 
     def _commit_point(self):
-        self.collecting = False
         target = self._current_target()
 
         if self.phase is Phase.CALIBRATION:
+            # Quality Gating: Sample spread measurement before batch acceptance
+            spread = rlog.sample_spread(self.batch)
+            if spread is not None and spread > SPREAD_THRESHOLD:
+                if self.retries < 3:
+                    rlog.event(
+                        "calibration_point_rejected", 
+                        point=[target.x, target.y], 
+                        spread=spread, 
+                        level=logging.WARNING
+                    )
+                    self.retries += 1
+                    self.collecting = False
+                    self.batch = []
+                    self.update()
+                    return
+                else:
+                    rlog.event(
+                        "calibration_point_forced", 
+                        point=[target.x, target.y], 
+                        spread=spread, 
+                        level=logging.WARNING
+                    )
+            
+            self.retries = 0
             rlog.log_calibration_point(target, len(self.batch), features_batch=self.batch)
             self.strategy.add_samples(target, self.batch)
         else:
             self.validation_predictions.append(self._median_prediction(self.batch))
 
+        self.collecting = False
         QApplication.beep()
         self.batch = []
         self.current_idx += 1
