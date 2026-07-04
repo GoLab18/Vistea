@@ -22,6 +22,7 @@ from core import research_log as rlog
 from core.vision import GazeEstimator, LandmarksData
 from core.filters import OneEuroFilter, PointFilter
 from core.calibration import (
+    DEFAULT_STRATEGY_KEY,
     STRATEGY_REGISTRY,
     CalibrationStrategy,
     NormalizedPoint,
@@ -148,19 +149,23 @@ class CalibrationOverlay(QWidget):
         if self.phase is Phase.CALIBRATION:
             self.strategy.train()
             total_samples = len(self.strategy.target_sequence()) * SAMPLES_PER_POINT
-            rlog.event("calibration_trained",
-                       n_points=len(self.strategy.target_sequence()),
-                       n_samples=total_samples)
+            rlog.event(
+                "calibration_trained",
+                n_points=len(self.strategy.target_sequence()),
+                n_samples=total_samples
+            )
             
             self.phase = Phase.VALIDATION
             self.current_idx = 0
         else:
             self._build_report()
-            rlog.event("validation_report",
-                       mean_error_px=self.report.mean_error_px,
-                       mean_error_deg=self.report.mean_error_deg,
-                       mean_error_percent=self.report.mean_error_percent,
-                       n_points=len(self.report.points))
+            rlog.event(
+                "validation_report",
+                mean_error_px=self.report.mean_error_px,
+                mean_error_deg=self.report.mean_error_deg,
+                mean_error_percent=self.report.mean_error_percent,
+                n_points=len(self.report.points)
+            )
             
             self.finished.emit(self.strategy, self.report)
             self.close()
@@ -261,6 +266,7 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         self.strategy_box = QComboBox()
         self.strategy_box.addItems(STRATEGY_REGISTRY.keys())
+        self.strategy_box.setCurrentText(DEFAULT_STRATEGY_KEY)
         self.strategy_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         controls.addWidget(self.strategy_box, stretch=1)
 
@@ -293,8 +299,8 @@ class MainWindow(QMainWindow):
         self.camera_thread.start()
 
     def start_calibration(self):
-        strategy_cls = STRATEGY_REGISTRY[self.strategy_box.currentText()]
-        self.strategy = strategy_cls()
+        strategy_factory = STRATEGY_REGISTRY[self.strategy_box.currentText()]
+        self.strategy = strategy_factory()
         self.gaze_filter.reset()
         self.latest_gaze = None
 

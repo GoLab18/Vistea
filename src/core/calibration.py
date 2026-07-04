@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from dataclasses import dataclass
-from typing import Dict, Final, List, Optional, Protocol, Sequence, Tuple
+from typing import Dict, Final, List, Optional, Protocol, Sequence, Tuple, Callable
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
@@ -15,15 +15,31 @@ class NormalizedPoint:
     y: float
 
 
-def make_grid(margin: float = 0.1) -> List[NormalizedPoint]:
-    """Standard 3x3 calibration grid with a safety margin.
-
+def make_grid(n_per_axis: int = 3, margin: float = 0.1) -> List[NormalizedPoint]:
+    """
+    Standard n x n calibration grid with a safety margin.
+    
     The margin keeps extreme targets away from the display edges to avoid
     unnaturally large eyeball rotations and to keep the irises well inside
     the camera frame.
     """
-    coords = (margin, 0.5, 1.0 - margin)
-    return [NormalizedPoint(x, y) for y in coords for x in coords]
+
+    if n_per_axis < 2:
+        n_per_axis = 2
+    coords = np.linspace(margin, 1.0 - margin, n_per_axis)
+    return [NormalizedPoint(float(x), float(y)) for y in coords for x in coords]
+
+
+def make_5point(margin: float = 0.1) -> List[NormalizedPoint]:
+    """
+    Traditional 5-point calibration grid (4 corners + 1 center).
+    Historically used as a baseline in simpler eye-tracking systems.
+    """
+
+    coords = [margin, 1.0 - margin]
+    pts = [NormalizedPoint(float(x), float(y)) for y in coords for x in coords]
+    pts.append(NormalizedPoint(0.5, 0.5))
+    return pts
 
 
 class CalibrationStrategy(Protocol):
@@ -81,7 +97,7 @@ class _SampleStore:
 
 class PolynomialRidgeCalibration:
     """
-    Non-linear 9-point calibration: 2nd-degree polynomial expansion of the
+    Non-linear calibration: 2nd-degree polynomial expansion of the
     4D eye-relative feature vector, followed by multi-output Ridge
     regression (scikit-learn's Ridge supports 2D targets natively).
 
@@ -94,10 +110,10 @@ class PolynomialRidgeCalibration:
     as natural data augmentation.
     """
 
-    name = "ridge_poly2_9pt"
+    name = "ridge_poly2_custom"
 
-    def __init__(self, alpha: float = 1e-3, degree: int = 2, margin: float = 0.1):
-        self._targets = make_grid(margin)
+    def __init__(self, alpha: float = 1e-3, degree: int = 2, margin: float = 0.1, grid: Optional[List[NormalizedPoint]] = None):
+        self._targets = grid if grid is not None else make_grid(3, margin)
         self._store = _SampleStore()
         self._model = make_pipeline(
             PolynomialFeatures(degree=degree, include_bias=False),
@@ -139,17 +155,17 @@ class HomographyCalibration:
     """
     Linear baseline strategy: a projective transform (homography) between
     the averaged 2D eye vector and the screen plane, estimated with OpenCV
-    from the same 9-point grid.
+    from the target grid.
 
     This is the closest well-posed equivalent of the piecewise-linear
     interpolation used in earlier webcam eye-tracking projects, and serves
     as the reference point for evaluating the non-linear model.
     """
 
-    name = "homography_9pt"
+    name = "homography_custom"
 
-    def __init__(self, margin: float = 0.1):
-        self._targets = make_grid(margin)
+    def __init__(self, margin: float = 0.1, grid: Optional[List[NormalizedPoint]] = None):
+        self._targets = grid if grid is not None else make_grid(3, margin)
         self._per_target: Dict[NormalizedPoint, List[FeatureVector]] = {}
         self._h: Optional[np.ndarray] = None
 
@@ -195,7 +211,19 @@ class HomographyCalibration:
         self._h = None
 
 
-STRATEGY_REGISTRY: Final[dict[str, type[CalibrationStrategy]]] = {
-    "Polynomial Ridge (9-point)": PolynomialRidgeCalibration,
-    "Homography baseline (9-point)": HomographyCalibration,
+def _set_name(strategy: CalibrationStrategy, name: str) -> CalibrationStrategy:
+    """Helper to cleanly override the strategy name for logging purposes."""
+
+    strategy.name = name
+    return strategy
+
+
+DEFAULT_STRATEGY_KEY: Final[str] = "Ridge 9-pt (default)"
+
+# Registry using factory lambdas to allow injecting distinct grid sizes
+STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
+    "Ridge 5-pt": lambda: _set_name(PolynomialRidgeCalibration(grid=make_5point()), "ridge_poly2_5pt"),
+    DEFAULT_STRATEGY_KEY: lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(3)), "ridge_poly2_9pt"),
+    "Ridge 16-pt": lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(4)), "ridge_poly2_16pt"),
+    "Homography (9-pt)": lambda: _set_name(HomographyCalibration(grid=make_grid(3)), "homography_9pt"),
 }
