@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QPoint, QRect
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot, QPoint, QRect
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QKeyEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,21 +24,25 @@ from core.vision import GazeEstimator, LandmarksData
 from core.filters import OneEuroFilter, PointFilter
 from core.calibration import (
     DEFAULT_STRATEGY_KEY,
+    PURSUIT_LAG_S,
     STRATEGY_REGISTRY,
     CalibrationStrategy,
     NormalizedPoint,
+    Segment,
 )
 from core.evaluation import ValidationReport, compute_point_error
 
-# Number of valid (non-blink) frames captured per calibration target.
+# Number of valid (non-blink) frames captured per STATIC calibration target.
 # At ~30 FPS this is roughly one second of fixation per point.
 SAMPLES_PER_POINT = 25
 
-# Quality gating threshold: maximum acceptable dispersion (spread) 
+# Quality gating threshold: maximum acceptable dispersion (spread)
 # for a collected batch. Above this threshold, the batch is rejected.
+# Applies to static segments only - dispersion of a batch collected while
+# tracking a MOVING target reflects the trajectory, not capture quality.
 SPREAD_THRESHOLD = 0.006
 
-# Validation targets intentionally lie OFF all training grids (5, 9, and 16-pt), 
+# Validation targets intentionally lie OFF all training grids (5, 9, and 16-pt),
 # so the report measures pure generalization instead of memorization.
 VALIDATION_TARGETS = [
     NormalizedPoint(0.2, 0.2),
@@ -81,19 +85,25 @@ class Phase(Enum):
 
 class CalibrationOverlay(QWidget):
     """
-    Frameless full-screen calibration surface.
+    Frameless full-screen calibration surface - a generic interpreter of the
+    strategy's calibration plan (Plan-as-Data, see core.calibration.Segment).
 
-    Targets are rendered at their true on-screen positions, so the eyeball
-    sweeps its full physiological range - this is what gives the regression
-    a usable signal (targets confined to a small video widget produce
-    sub-noise iris displacements). For every target the user fixates the
-    dot and presses SPACE; the overlay then records SAMPLES_PER_POINT valid
-    frames (blinks are rejected upstream) while drawing a progress ring.
-    A validation phase with off-grid targets follows automatically and
-    produces a quantitative accuracy report.
+    Static segments: targets are rendered at their true on-screen positions;
+    for every target the user fixates the dot and presses SPACE, then
+    SAMPLES_PER_POINT valid frames are recorded (blinks rejected upstream)
+    behind a progress ring, with quality gating on the batch spread.
+
+    Pursuit segments: SPACE starts a smooth sweep of the target along the
+    declared trajectory; every valid frame is collected continuously and
+    labelled with the trajectory position PURSUIT_LAG_S seconds BEFORE the
+    capture instant (clock-based oculomotor-lag compensation, exact under
+    camera FPS jitter).
+
+    A validation phase with off-grid static targets follows automatically
+    and produces a quantitative accuracy report.
     """
 
-    finished = Signal(object, object)   # (strategy, ValidationReport | None)
+    finished = Signal(object, object) # (strategy, ValidationReport | None)
     aborted = Signal()
 
     def __init__(self, strategy: CalibrationStrategy, screen):
@@ -106,41 +116,87 @@ class CalibrationOverlay(QWidget):
 
         self._screen = screen
         self.phase = Phase.CALIBRATION
-        self.targets: List[NormalizedPoint] = strategy.target_sequence()
-        self.current_idx = 0
+        self.plan: List[Segment] = strategy.plan()
+        self.seg_idx = 0
+        self.point_idx = 0 # index within a static segment / validation
         self.retries = 0
-        self.collecting = False
+        self.collecting = False # static batch capture in progress
         self.batch: List[List[float]] = []
         self.validation_predictions: List[List[float]] = []
         self.report: Optional[ValidationReport] = None
+
+        # Pursuit segment state
+        self.pursuit_active = False
+        self.pursuit_t0 = 0.0
+        self.pursuit_samples = 0
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._on_anim_tick)
+
 
     def start(self):
         self.setGeometry(self._screen.geometry())
         self.showFullScreen()
         self.setFocus()
 
+    def _build_vec(self, data: LandmarksData) -> Optional[List[float]]:
+        return data.features.as_vector()
+
     @Slot(np.ndarray, object)
     def on_frame(self, _frame: np.ndarray, data: LandmarksData):
-        if not self.collecting or not data.gaze_valid or data.features is None:
+        if not data.gaze_valid or data.features is None:
             return
-        self.batch.append(data.features.as_vector())
+
+        if self.pursuit_active:
+            self._on_pursuit_frame(data)
+            return
+
+        if not self.collecting:
+            return
+        vec = self._build_vec(data)
+        if vec is None:
+            return
+        self.batch.append(vec)
         if len(self.batch) >= SAMPLES_PER_POINT:
             self._commit_point()
         self.update()
+
+    def _on_pursuit_frame(self, data: LandmarksData):
+        segment = self._current_segment()
+        elapsed = time.monotonic() - self.pursuit_t0
+        if elapsed >= segment.duration_s:
+            self._finish_pursuit(segment)
+            return
+        if elapsed < PURSUIT_LAG_S:
+            return # the eye has not locked onto the target yet
+        vec = self._build_vec(data)
+        if vec is None:
+            return
+        label = segment.position_at(elapsed - PURSUIT_LAG_S)
+        self.strategy.add_samples(label, [vec])
+        self.pursuit_samples += 1
+
+    def _on_anim_tick(self):
+        if self.pursuit_active:
+            segment = self._current_segment()
+            if time.monotonic() - self.pursuit_t0 >= segment.duration_s:
+                self._finish_pursuit(segment)
+        self.update()
+
 
     def _commit_point(self):
         target = self._current_target()
 
         if self.phase is Phase.CALIBRATION:
-            # Quality Gating: Sample spread measurement before batch acceptance
+            # Quality Gating: sample spread measurement before batch acceptance
             spread = rlog.sample_spread(self.batch)
             if spread is not None and spread > SPREAD_THRESHOLD:
                 if self.retries < 3:
                     rlog.event(
-                        "calibration_point_rejected", 
-                        point=[target.x, target.y], 
-                        spread=spread, 
-                        level=logging.WARNING
+                        "calibration_point_rejected",
+                        point=[target.x, target.y],
+                        spread=spread,
+                        level=logging.WARNING,
                     )
                     self.retries += 1
                     self.collecting = False
@@ -149,12 +205,12 @@ class CalibrationOverlay(QWidget):
                     return
                 else:
                     rlog.event(
-                        "calibration_point_forced", 
-                        point=[target.x, target.y], 
-                        spread=spread, 
-                        level=logging.WARNING
+                        "calibration_point_forced",
+                        point=[target.x, target.y],
+                        spread=spread,
+                        level=logging.WARNING,
                     )
-            
+
             self.retries = 0
             rlog.log_calibration_point(target, len(self.batch), features_batch=self.batch)
             self.strategy.add_samples(target, self.batch)
@@ -164,42 +220,63 @@ class CalibrationOverlay(QWidget):
         self.collecting = False
         QApplication.beep()
         self.batch = []
-        self.current_idx += 1
+        self.point_idx += 1
 
-        if self.current_idx >= len(self._phase_targets()):
-            self._advance_phase()
+        if self.point_idx >= len(self._phase_targets()):
+            self._advance_segment()
         self.update()
+
+    def _finish_pursuit(self, segment: Segment):
+        self.pursuit_active = False
+        self._anim.stop()
+        rlog.event(
+            "pursuit_segment_captured",
+            n_samples=self.pursuit_samples,
+            duration_s=segment.duration_s,
+            lag_s=PURSUIT_LAG_S,
+        )
+        QApplication.beep()
+        self._advance_segment()
+        self.update()
+
+    def _advance_segment(self):
+        if self.phase is Phase.VALIDATION:
+            self._finish_validation()
+            return
+        self.seg_idx += 1
+        self.point_idx = 0
+        if self.seg_idx >= len(self.plan):
+            self._train_and_enter_validation()
+
+    def _train_and_enter_validation(self):
+        self.strategy.train()
+        rlog.event(
+            "calibration_trained",
+            n_points=len(self.strategy.target_sequence()),
+            n_samples=len(getattr(self.strategy, "_store", [])) or None,
+        )
+
+
+        self.phase = Phase.VALIDATION
+        self.point_idx = 0
+
+    def _finish_validation(self):
+        self._build_report()
+        rlog.event(
+            "validation_report",
+            mean_error_px=self.report.mean_error_px,
+            mean_error_deg=self.report.mean_error_deg,
+            mean_error_percent=self.report.mean_error_percent,
+            n_points=len(self.report.points),
+        )
+        self.finished.emit(self.strategy, self.report)
+        self.close()
 
     def _median_prediction(self, batch: List[List[float]]) -> List[float]:
         preds = [self.strategy.predict(vec) for vec in batch]
         xs = sorted(p.x for p in preds if p is not None)
         ys = sorted(p.y for p in preds if p is not None)
         return [xs[len(xs) // 2], ys[len(ys) // 2]]
-
-    def _advance_phase(self):
-        if self.phase is Phase.CALIBRATION:
-            self.strategy.train()
-            total_samples = len(self.strategy.target_sequence()) * SAMPLES_PER_POINT
-            rlog.event(
-                "calibration_trained",
-                n_points=len(self.strategy.target_sequence()),
-                n_samples=total_samples
-            )
-            
-            self.phase = Phase.VALIDATION
-            self.current_idx = 0
-        else:
-            self._build_report()
-            rlog.event(
-                "validation_report",
-                mean_error_px=self.report.mean_error_px,
-                mean_error_deg=self.report.mean_error_deg,
-                mean_error_percent=self.report.mean_error_percent,
-                n_points=len(self.report.points)
-            )
-            
-            self.finished.emit(self.strategy, self.report)
-            self.close()
 
     def _build_report(self):
         size_mm = self._screen.physicalSize()
@@ -210,31 +287,45 @@ class CalibrationOverlay(QWidget):
             screen_h_px=geo.height(),
         )
         for target, pred in zip(VALIDATION_TARGETS, self.validation_predictions):
-            pe = compute_point_error(
-                target,
-                NormalizedPoint(pred[0], pred[1]),
-                geo.width(),
-                geo.height(),
-                size_mm.width() or None,
-                size_mm.height() or None,
+            report.points.append(
+                compute_point_error(
+                    target,
+                    NormalizedPoint(pred[0], pred[1]),
+                    geo.width(),
+                    geo.height(),
+                    size_mm.width() or None,
+                    size_mm.height() or None,
+                )
             )
-            rlog.log_validation_point(pe.target, pe.error_px, pe.error_deg)
-            report.points.append(pe)
+            rlog.log_validation_point(target, report.points[-1].error_px, report.points[-1].error_deg)
         self.report = report
 
+    def _current_segment(self) -> Segment:
+        return self.plan[min(self.seg_idx, len(self.plan) - 1)]
+
     def _phase_targets(self) -> List[NormalizedPoint]:
-        return self.targets if self.phase is Phase.CALIBRATION else VALIDATION_TARGETS
+        if self.phase is Phase.VALIDATION:
+            return VALIDATION_TARGETS
+        return self._current_segment().points
 
     def _current_target(self) -> NormalizedPoint:
-        return self._phase_targets()[self.current_idx]
+        return self._phase_targets()[self.point_idx]
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.isAutoRepeat():
             return
-        if event.key() == Qt.Key.Key_Space and not self.collecting:
-            self.collecting = True
-            self.batch = []
-            self.update()
+        if event.key() == Qt.Key.Key_Space:
+            if self.phase is Phase.CALIBRATION and self._current_segment().kind == "pursuit":
+                if not self.pursuit_active:
+                    self.pursuit_active = True
+                    self.pursuit_t0 = time.monotonic()
+                    self.pursuit_samples = 0
+                    self._anim.start()
+                    self.update()
+            elif not self.collecting:
+                self.collecting = True
+                self.batch = []
+                self.update()
         elif event.key() == Qt.Key.Key_Escape:
             self.aborted.emit()
             self.close()
@@ -244,17 +335,26 @@ class CalibrationOverlay(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        target = self._current_target()
+        pursuit = self.phase is Phase.CALIBRATION and self._current_segment().kind == "pursuit"
+
+        if pursuit:
+            segment = self._current_segment()
+            elapsed = (time.monotonic() - self.pursuit_t0) if self.pursuit_active else 0.0
+            target = segment.position_at(elapsed)
+        else:
+            target = self._current_target()
         cx, cy = int(target.x * w), int(target.y * h)
 
         color = QColor(52, 152, 219) if self.phase is Phase.CALIBRATION else QColor(155, 89, 182)
+        if pursuit:
+            color = QColor(46, 204, 113)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(QPoint(cx, cy), 16, 16)
         painter.setBrush(QColor(255, 255, 255))
         painter.drawEllipse(QPoint(cx, cy), 4, 4)
 
-        if self.collecting:
+        if self.collecting and not pursuit:
             pen = QPen(QColor(46, 204, 113))
             pen.setWidth(4)
             painter.setPen(pen)
@@ -262,14 +362,34 @@ class CalibrationOverlay(QWidget):
             span = int(360 * 16 * len(self.batch) / SAMPLES_PER_POINT)
             painter.drawArc(QRect(cx - 26, cy - 26, 52, 52), 90 * 16, -span)
 
+        if pursuit and self.pursuit_active:
+            segment = self._current_segment()
+            frac = min((time.monotonic() - self.pursuit_t0) / segment.duration_s, 1.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(46, 204, 113))
+            painter.drawRect(0, h - 8, int(w * frac), 8)
+
         painter.setPen(QColor(220, 220, 220))
         painter.setFont(QFont("Arial", 14))
-        phase_name = "CALIBRATION" if self.phase is Phase.CALIBRATION else "VALIDATION"
-        total = len(self._phase_targets())
-        msg = (
-            f"{phase_name}  -  point {self.current_idx + 1}/{total}   |   "
-            "Look at the dot and press SPACE. Keep looking until the ring completes.   |   ESC to abort"
-        )
+        if self.phase is Phase.VALIDATION:
+            msg = (
+                f"VALIDATION  -  point {self.point_idx + 1}/{len(VALIDATION_TARGETS)}   |   "
+                "Look at the dot and press SPACE. Keep looking until the ring completes.   |   ESC to abort"
+            )
+        elif pursuit:
+            msg = (
+                "CALIBRATION (pursuit)   |   "
+                + ("Follow the moving dot with your eyes." if self.pursuit_active
+                 else "Press SPACE, then FOLLOW the moving dot with your eyes.")
+                + "   |   ESC to abort"
+            )
+        else:
+            total = len(self._phase_targets())
+            seg_info = f"segment {self.seg_idx + 1}/{len(self.plan)}, " if len(self.plan) > 1 else ""
+            msg = (
+                f"CALIBRATION  -  {seg_info}point {self.point_idx + 1}/{total}   |   "
+                "Look at the dot and press SPACE. Keep looking until the ring completes.   |   ESC to abort"
+            )
         painter.drawText(QRect(0, h - 60, w, 40), Qt.AlignmentFlag.AlignCenter, msg)
         painter.end()
 
@@ -381,11 +501,17 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray, object)
     def update_ui(self, frame: np.ndarray, data: LandmarksData):
-        if self.strategy is not None and self.strategy.is_calibrated() and data.gaze_valid:
-            raw = self.strategy.predict(data.features.as_vector())
-            if raw is not None:
-                fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
-                self.latest_gaze = NormalizedPoint(fx, fy)
+        if (
+            self.strategy is not None
+            and self.strategy.is_calibrated()
+            and data.gaze_valid
+        ):
+            vec = data.features.as_vector()
+            if vec is not None:
+                raw = self.strategy.predict(vec)
+                if raw is not None:
+                    fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
+                    self.latest_gaze = NormalizedPoint(fx, fy)
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
