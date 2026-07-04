@@ -18,5 +18,6 @@ desktop.ini
 # local & env
 *.log
 .env
+logs/
 
 models/
