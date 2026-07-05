@@ -9,6 +9,8 @@ from typing import Final, Tuple, Optional, Any, List
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+from core.preprocessing import FramePreprocessor, NoPreprocessing
+
 MODEL_DIR: Final[str] = "models"
 MODEL_NAME: Final[str] = "face_landmarker.task"
 MODEL_URL: Final[str] = (
@@ -178,6 +180,8 @@ class GazeEstimator:
         self.model_path = os.path.join(MODEL_DIR, MODEL_NAME)
         self._ensure_model_exists()
         self.draw_debug = draw_debug
+        
+        self.preprocessor: FramePreprocessor = NoPreprocessing()
 
         base_options = python.BaseOptions(model_asset_path=self.model_path)
         options = vision.FaceLandmarkerOptions(
@@ -200,6 +204,8 @@ class GazeEstimator:
     def process_frame(
         self, frame: np.ndarray, timestamp_ms: int
     ) -> Tuple[np.ndarray, LandmarksData]:
+        frame = self.preprocessor.process(frame)
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 

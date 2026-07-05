@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import research_log as rlog
+from core.preprocessing import PREPROCESSOR_FACTORIES, LIGHTING_CONDITIONS
 from core.vision import GazeEstimator, LandmarksData, build_feature_vector  # [ITER3] build_feature_vector
 from core.filters import OneEuroFilter, PointFilter
 from core.head_pose import HeadPoseMonitor
@@ -427,11 +428,35 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.status_label)
 
         controls = QHBoxLayout()
+        controls.setSpacing(10)
+
+        lbl_strategy = QLabel("Strategy:")
+        lbl_strategy.setStyleSheet("font-weight: bold;")
+        controls.addWidget(lbl_strategy)
+
         self.strategy_box = QComboBox()
         self.strategy_box.addItems(STRATEGY_REGISTRY.keys())
         self.strategy_box.setCurrentText(DEFAULT_STRATEGY_KEY)
         self.strategy_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        controls.addWidget(self.strategy_box, stretch=1)
+        controls.addWidget(self.strategy_box, stretch=2)
+
+        lbl_lighting = QLabel("Lighting:")
+        lbl_lighting.setStyleSheet("font-weight: bold;")
+        controls.addWidget(lbl_lighting)
+
+        self.lighting_box = QComboBox()
+        self.lighting_box.addItems(LIGHTING_CONDITIONS)
+        self.lighting_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        controls.addWidget(self.lighting_box, stretch=1)
+
+        lbl_prep = QLabel("Preprocessing:")
+        lbl_prep.setStyleSheet("font-weight: bold;")
+        controls.addWidget(lbl_prep)
+
+        self.prep_box = QComboBox()
+        self.prep_box.addItems(PREPROCESSOR_FACTORIES.keys())
+        self.prep_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        controls.addWidget(self.prep_box, stretch=2)
 
         self.btn_calibrate = QPushButton("Start Calibration")
         self.btn_calibrate.setStyleSheet(
@@ -448,6 +473,7 @@ class MainWindow(QMainWindow):
         self.btn_reset.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_reset.clicked.connect(self.reset_calibration)
         controls.addWidget(self.btn_reset)
+
         main_layout.addLayout(controls)
 
         self.strategy: Optional[CalibrationStrategy] = None
@@ -463,6 +489,20 @@ class MainWindow(QMainWindow):
         self.camera_thread.frame_ready.connect(self.update_ui)
         self.camera_thread.start()
 
+        self.lighting_box.currentTextChanged.connect(
+            lambda name: rlog.bind(lighting_condition=name)
+        )
+
+        def _swap_prep(label: str) -> None:
+            prep = PREPROCESSOR_FACTORIES[label]()
+            self.camera_thread.estimator.preprocessor = prep
+            rlog.bind(preprocessing=prep.name)
+            
+        self.prep_box.currentTextChanged.connect(_swap_prep)
+        
+        _swap_prep(self.prep_box.currentText())
+        rlog.bind(lighting_condition=self.lighting_box.currentText())
+
     def start_calibration(self):
         strategy_factory = STRATEGY_REGISTRY[self.strategy_box.currentText()]
         self.strategy = strategy_factory()
@@ -475,7 +515,8 @@ class MainWindow(QMainWindow):
             session_id=rlog.new_session_id(),
             strategy=self.strategy.name,
             grid_size=len(self.strategy.target_sequence()),
-            lighting_condition="unknown",
+            lighting_condition=self.lighting_box.currentText(),
+            preprocessing=self.camera_thread.estimator.preprocessor.name,
         )
 
         self.overlay = CalibrationOverlay(self.strategy, self._screen)
