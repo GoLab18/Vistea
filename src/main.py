@@ -2,7 +2,7 @@ import sys
 import time
 import logging
 from enum import Enum, auto
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -20,8 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from core import research_log as rlog
-from core.vision import GazeEstimator, LandmarksData
+from core.vision import GazeEstimator, LandmarksData, build_feature_vector  # [ITER3] build_feature_vector
 from core.filters import OneEuroFilter, PointFilter
+from core.head_pose import HeadPoseMonitor
 from core.calibration import (
     DEFAULT_STRATEGY_KEY,
     PURSUIT_LAG_S,
@@ -133,6 +134,8 @@ class CalibrationOverlay(QWidget):
         self._anim.setInterval(16)
         self._anim.timeout.connect(self._on_anim_tick)
 
+        self.pose_batch: List[Tuple[float, float, float]] = []
+        self.head_monitor: Optional[HeadPoseMonitor] = None
 
     def start(self):
         self.setGeometry(self._screen.geometry())
@@ -140,6 +143,8 @@ class CalibrationOverlay(QWidget):
         self.setFocus()
 
     def _build_vec(self, data: LandmarksData) -> Optional[List[float]]:
+        if getattr(self.strategy, "use_head_pose", False):
+            return build_feature_vector(data, use_head_pose=True)
         return data.features.as_vector()
 
     @Slot(np.ndarray, object)
@@ -157,6 +162,8 @@ class CalibrationOverlay(QWidget):
         if vec is None:
             return
         self.batch.append(vec)
+        if data.head_pose is not None and self.phase is Phase.CALIBRATION:
+            self.pose_batch.append((data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll))
         if len(self.batch) >= SAMPLES_PER_POINT:
             self._commit_point()
         self.update()
@@ -175,6 +182,8 @@ class CalibrationOverlay(QWidget):
         label = segment.position_at(elapsed - PURSUIT_LAG_S)
         self.strategy.add_samples(label, [vec])
         self.pursuit_samples += 1
+        if data.head_pose is not None:
+            self.pose_batch.append((data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll))
 
     def _on_anim_tick(self):
         if self.pursuit_active:
@@ -182,7 +191,6 @@ class CalibrationOverlay(QWidget):
             if time.monotonic() - self.pursuit_t0 >= segment.duration_s:
                 self._finish_pursuit(segment)
         self.update()
-
 
     def _commit_point(self):
         target = self._current_target()
@@ -256,6 +264,10 @@ class CalibrationOverlay(QWidget):
             n_samples=len(getattr(self.strategy, "_store", [])) or None,
         )
 
+        monitor = HeadPoseMonitor()
+        if monitor.set_reference(self.pose_batch):
+            self.head_monitor = monitor
+            rlog.event("chinrest_reference_set", n_pose_samples=len(self.pose_batch))
 
         self.phase = Phase.VALIDATION
         self.point_idx = 0
@@ -440,11 +452,13 @@ class MainWindow(QMainWindow):
 
         self.strategy: Optional[CalibrationStrategy] = None
         self.overlay: Optional[CalibrationOverlay] = None
+        self.head_monitor: Optional[HeadPoseMonitor] = None
+        self._pose_ok = True
 
         # Output smoothing (screen-space): tuned per Casiez et al. procedure.
         self.gaze_filter: PointFilter = OneEuroFilter(min_cutoff=0.8, beta=0.5)
         self.latest_gaze: Optional[NormalizedPoint] = None
-
+ 
         self.camera_thread = CameraThread()
         self.camera_thread.frame_ready.connect(self.update_ui)
         self.camera_thread.start()
@@ -454,6 +468,8 @@ class MainWindow(QMainWindow):
         self.strategy = strategy_factory()
         self.gaze_filter.reset()
         self.latest_gaze = None
+        self.head_monitor = None
+        self._pose_ok = True
 
         rlog.bind(
             session_id=rlog.new_session_id(),
@@ -470,6 +486,8 @@ class MainWindow(QMainWindow):
 
     @Slot(object, object)
     def on_calibration_finished(self, strategy: CalibrationStrategy, report: ValidationReport):
+        if self.overlay is not None:
+            self.head_monitor = self.overlay.head_monitor
         self._detach_overlay()
         summary = report.summary()
         print(summary)
@@ -495,18 +513,57 @@ class MainWindow(QMainWindow):
     def reset_calibration(self):
         self.strategy = None
         self.latest_gaze = None
+        self.head_monitor = None
+        self._pose_ok = True
         self.gaze_filter.reset()
         self.status_label.setText("Calibration cleared. Choose a strategy and start calibration.")
         self.status_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
 
+    def _check_head_pose(self, data: LandmarksData) -> bool:
+        """Virtual chinrest: freeze the cursor and warn while the head has
+        drifted from the calibration pose. Returns True when pose is OK."""
+
+        if self.head_monitor is None or data.head_pose is None:
+            return True
+        state = self.head_monitor.update(
+            data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll
+        )
+        if not state.ok:
+            if self._pose_ok or self.head_monitor.should_warn():
+                axis, dev = state.worst_axis()
+                rlog.event(
+                    "head_pose_drift",
+                    dyaw_deg=round(state.dyaw_deg, 1),
+                    dpitch_deg=round(state.dpitch_deg, 1),
+                    droll_deg=round(state.droll_deg, 1),
+                    level=logging.WARNING,
+                )
+                self.status_label.setText(
+                    f"Head moved from calibration pose ({axis} {dev:+.0f} deg) - "
+                    "return to position or recalibrate."
+                )
+                self.status_label.setStyleSheet(
+                    "font-size: 15px; font-weight: bold; color: #e67e22; padding: 8px;"
+                )
+            self._pose_ok = False
+        elif not self._pose_ok:
+            self._pose_ok = True
+            self.status_label.setText("Head pose OK.")
+            self.status_label.setStyleSheet(
+                "font-size: 15px; font-weight: bold; color: #2ecc71; padding: 8px;"
+            )
+        return state.ok
+
     @Slot(np.ndarray, object)
     def update_ui(self, frame: np.ndarray, data: LandmarksData):
+        pose_ok = self._check_head_pose(data)
         if (
             self.strategy is not None
             and self.strategy.is_calibrated()
             and data.gaze_valid
+            and pose_ok # pause the cursor while drifted
         ):
-            vec = data.features.as_vector()
+            vec = build_feature_vector(data, use_head_pose=getattr(self.strategy, "use_head_pose", False))
             if vec is not None:
                 raw = self.strategy.predict(vec)
                 if raw is not None:
