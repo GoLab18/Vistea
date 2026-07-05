@@ -1,5 +1,6 @@
 import os
 import urllib.request
+import math
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -55,15 +56,96 @@ class GazeFeatures:
         return [self.left_h, self.left_v, self.right_h, self.right_v]
 
 
+@dataclass(frozen=True)
+class HeadPose:
+    """Head orientation in radians, decomposed from MediaPipe's 4x4
+    facial transformation matrix (canonical face -> camera space).
+ 
+    Sign conventions follow the camera frame and are internally consistent,
+    both consumers only ever use them consistently: the regression learns
+    whatever convention it is given, and the virtual chinrest compares
+    against a reference captured in the same convention.
+    """
+
+    yaw: float    # rotation about the vertical axis (looking left/right)
+    pitch: float  # rotation about the horizontal axis (looking up/down)
+    roll: float   # in-plane rotation (head tilt)
+
+    def as_degrees(self) -> Tuple[float, float, float]:
+        return (math.degrees(self.yaw), math.degrees(self.pitch), math.degrees(self.roll))
+
+
+def decompose_head_pose(transform_4x4: np.ndarray) -> Optional[HeadPose]:
+    """
+    Extracts Tait-Bryan angles (ZYX order: R = Rz(roll) @ Ry(yaw) @ Rx(pitch))
+    from the rotation part of the facial transformation matrix.
+
+    Numerically stable atan2 formulation with an explicit gimbal-lock branch
+    (|cos(yaw)| ~ 0, i.e. yaw ~ +-90 deg - far beyond anything a user facing
+    the screen can produce, but handled for correctness).
+    """
+
+    m = np.asarray(transform_4x4, dtype=float)
+    if m.shape != (4, 4):
+        return None
+    r = m[:3, :3]
+
+    # Guard against a degenerate (non-rotation) block.
+    if not np.all(np.isfinite(r)):
+        return None
+
+    sy = math.sqrt(r[0, 0] ** 2 + r[1, 0] ** 2)
+    if sy > 1e-6:
+        pitch = math.atan2(r[2, 1], r[2, 2])   # about X
+        yaw = math.atan2(-r[2, 0], sy)         # about Y
+        roll = math.atan2(r[1, 0], r[0, 0])    # about Z
+    else: # gimbal lock: yaw = +-90 deg, roll and pitch are coupled
+        pitch = math.atan2(-r[1, 2], r[1, 1])
+        yaw = math.atan2(-r[2, 0], sy)
+        roll = 0.0
+    return HeadPose(yaw=yaw, pitch=pitch, roll=roll)
+
+
 @dataclass
 class LandmarksData:
     face_detected: bool = False
     gaze_valid: bool = False  # False during blinks / degenerate geometry
     features: Optional[GazeFeatures] = None
+    head_pose: Optional[HeadPose] = None
     left_iris_px: Optional[Tuple[int, int]] = None
     right_iris_px: Optional[Tuple[int, int]] = None
     blendshapes: Optional[Any] = None
     timestamp_ms: int = 0
+
+
+def build_feature_vector(data: LandmarksData, use_head_pose: bool = False) -> Optional[List[float]]:
+    """
+    Assembles the regression input from a processed frame.
+
+    4D (default): the PC-EC vector [left_h, left_v, right_h, right_v].
+    7D (use_head_pose): PC-EC + [yaw, pitch, roll] in radians.
+
+    Radians are used unscaled on purpose: realistic head rotations span
+    roughly +-0.3 rad while the PC-EC components span roughly +-0.2, so both
+    feature groups live on a comparable scale and the (unstandardized) Ridge
+    penalty treats them evenhandedly. PC-EC already cancels roll within the
+    2D image plane, but yaw/pitch (and residual perspective effects of roll)
+    change the projected eye geometry itself - appending the pose lets the
+    polynomial regression learn that compensation, provided the calibration
+    covered slight head movement.
+
+    Returns None when the frame carries no valid gaze (or, in pose mode,
+    no pose) - callers skip such frames uniformly.
+    """
+
+    if not data.gaze_valid or data.features is None:
+        return None
+    vec = data.features.as_vector()
+    if not use_head_pose:
+        return vec
+    if data.head_pose is None:
+        return None
+    return vec + [data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll]
 
 
 def _eye_relative(
@@ -83,7 +165,7 @@ def _eye_relative(
 class GazeEstimator:
     """
     Wraps the MediaPipe Face Landmarker (Tasks API, VIDEO mode) and converts
-    raw landmarks into eye-relative gaze features.
+    raw landmarks into eye-relative gaze features + head pose.
 
     Note: no temporal filtering happens here on purpose. Calibration needs
     raw, unlagged samples (it averages over many frames itself), and the
@@ -131,6 +213,10 @@ class GazeEstimator:
         data.face_detected = True
         if detection_result.face_blendshapes:
             data.blendshapes = detection_result.face_blendshapes[0]
+        if detection_result.facial_transformation_matrixes:
+            data.head_pose = decompose_head_pose(
+                np.asarray(detection_result.facial_transformation_matrixes[0])
+            )
 
         lm = detection_result.face_landmarks[0]
         h, w, _ = frame.shape
