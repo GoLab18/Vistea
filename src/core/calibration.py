@@ -124,6 +124,7 @@ class CalibrationStrategy(Protocol):
     """
 
     name: str
+    use_head_pose: bool # expects pose-augmented feature vectors
 
     def target_sequence(self) -> List[NormalizedPoint]:
         ...
@@ -223,7 +224,8 @@ class PolynomialRidgeCalibration(_RidgeMixin):
 
     The model is dimension-agnostic: it fits whatever feature length it is
     given, so the same class serves the 4D PC-EC vector and the 7D
-    pose-augmented vector (Iteration 3).
+    pose-augmented vector - the difference is declared via
+    ``use_head_pose`` and resolved at feature-building time in the UI.
     """
 
     name = "ridge_poly2_custom"
@@ -234,8 +236,10 @@ class PolynomialRidgeCalibration(_RidgeMixin):
         degree: int = 2,
         margin: float = 0.1,
         grid: Optional[List[NormalizedPoint]] = None,
+        use_head_pose: bool = False,
     ):
         self._targets = grid if grid is not None else make_grid(3, margin)
+        self.use_head_pose = use_head_pose
         self._init_model(alpha, degree)
 
     def target_sequence(self) -> List[NormalizedPoint]:
@@ -257,6 +261,7 @@ class HomographyCalibration:
     """
 
     name = "homography_custom"
+    use_head_pose = False  # 2D->2D transform cannot consume pose
 
     def __init__(self, margin: float = 0.1, grid: Optional[List[NormalizedPoint]] = None):
         self._targets = grid if grid is not None else make_grid(3, margin)
@@ -322,6 +327,7 @@ class SmoothPursuitCalibration(_RidgeMixin):
     """
 
     name = "smooth_pursuit_60pt"
+    use_head_pose = False
 
     # Dense polyline resolution for smooth on-screen animation.
     PATH_RESOLUTION = 480
@@ -348,12 +354,21 @@ class HybridCalibration(_RidgeMixin):
     """
 
     name = "hybrid_9pt_pursuit"
+    use_head_pose = False
 
     PATH_RESOLUTION = 480
 
-    def __init__(self, alpha: float = 1e-3, degree: int = 2, duration_s: float = 24.0, margin: float = 0.1):
+    def __init__(
+        self,
+        alpha: float = 1e-3,
+        degree: int = 2,
+        duration_s: float = 24.0,
+        margin: float = 0.1,
+        use_head_pose: bool = False,
+    ):
         self.duration_s = duration_s
         self._grid = make_grid(3, margin)
+        self.use_head_pose = use_head_pose
         self._init_model(alpha, degree)
 
     def target_sequence(self) -> List[NormalizedPoint]:
@@ -384,4 +399,8 @@ STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
     "Homography (9-pt)": lambda: _set_name(HomographyCalibration(grid=make_grid(3)), "homography_9pt"),
     "Smooth Pursuit (24 s)": lambda: SmoothPursuitCalibration(),
     "Hybrid 9-pt + Pursuit": lambda: HybridCalibration(),
+    "Ridge 9-pt + pose": lambda: _set_name(
+        PolynomialRidgeCalibration(grid=make_grid(3), use_head_pose=True), "ridge_poly2_9pt_pose"
+    ),
+    "Hybrid + pose": lambda: _set_name(HybridCalibration(use_head_pose=True), "hybrid_9pt_pursuit_pose"),
 }
