@@ -649,6 +649,8 @@ class MainWindow(QMainWindow):
                 self.status_label.setStyleSheet(
                     "font-size: 15px; font-weight: bold; color: #e67e22; padding: 8px;"
                 )
+            if self._pose_ok and self.gaze_controller is not None:
+                self.gaze_controller.notify("Head out of calibration pose", "warning")
             self._pose_ok = False
         elif not self._pose_ok:
             self._pose_ok = True
@@ -656,6 +658,8 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet(
                 "font-size: 15px; font-weight: bold; color: #2ecc71; padding: 8px;"
             )
+            if self.gaze_controller is not None:
+                self.gaze_controller.notify("Head pose OK", "info")
         return state.ok
 
     @Slot(np.ndarray, object)

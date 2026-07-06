@@ -4,7 +4,10 @@ Structure:
 - ``GazeOverlay`` - fullscreen, transparent, INPUT-TRANSPARENT window drawing
   the gaze cursor, fixation ring, dwell progress and edge-zone hints. Input
   transparency matters twice: the user's real applications stay clickable
-  underneath, and navigation-mode OS clicks pass through to them.
+  underneath, and navigation-mode OS clicks pass through to them. It also
+  surfaces short-lived toast notifications (state changes such as head-pose
+  drift or a keyboard below the accuracy floor) since the main window is
+  minimized while gaze mode is active.
 - ``TileBoardWindow`` - base for gaze-activated tile panels. The windows
   never take OS focus (``WindowDoesNotAcceptFocus`` +
   ``WA_ShowWithoutActivating``), which is what makes system-wide typing
@@ -18,7 +21,7 @@ Structure:
   read instead of type).
 - ``BrowserBar`` - side strip for navigation mode: back/forward/page
   up/down, switch to keyboard, exit.
-- ``SuggestionBar`` - prefix word-completion strip docked against the keyboard, one-dwell accept + save to the user's dictionary.
+- ``SuggestionBar`` - prefix word-completion strip docked against the keyboard, one-dwell accept + save to the user's dictionary. # [commit-podpowiedzi]
 - Modes (State Pattern behind the ``GazeMode`` Protocol): ``KeyboardMode``
   types into the OS-focused field (and mirrors it in the preview strip) and
   feeds drift correction, ``NavigationMode`` dwell-clicks and enables
@@ -330,6 +333,7 @@ class KeyboardWindow(TileBoardWindow):
     """
 
     committed = Signal(str) # emitted on ENTER with the preview content
+    floor_unmet_changed = Signal(bool)
 
     BUFFER_H = 60
     TILE_MAX = 130
@@ -428,6 +432,7 @@ class KeyboardWindow(TileBoardWindow):
                     min_tile_px=self.min_tile_px,
                     level=logging.WARNING
                 )
+            self.floor_unmet_changed.emit(floor_unmet)
 
         board_w = tile * n_cols
         board_h = tile * n_rows + self.BUFFER_H
@@ -746,6 +751,20 @@ class GazeOverlay(QWidget):
         self.scroll_active = 0 # +1 top / -1 bottom / 0
         self.scroll_zone_frac = 0.12
 
+        self._toasts: List[Tuple[str, str, float]] = [] # (text, level, expiry monotonic)
+
+    def notify(self, text: str, level: str = "info", ttl: float = 3.5) -> None:
+        """Queue a short-lived toast for the overlay, keeps only the 3 most
+        recent so a burst of state changes cannot pile up on screen."""
+
+        self._toasts.append((text, level, time.monotonic() + ttl))
+        self._toasts = self._toasts[-3:]
+        self.update()
+
+    def _prune_toasts(self) -> None:
+        now = time.monotonic()
+        self._toasts = [t for t in self._toasts if t[2] > now]
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -761,6 +780,30 @@ class GazeOverlay(QWidget):
         painter.setPen(QColor(255, 255, 255, 200))
         painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         painter.drawText(QRect(0, 6, w, 30), Qt.AlignmentFlag.AlignHCenter, f"GAZE MODE - {self.mode_name}")
+
+        self._prune_toasts()
+        toast_font = QFont("Arial", 13)
+        painter.setFont(toast_font)
+        metrics = painter.fontMetrics()
+        toast_y = 40
+        border_by_level = {
+            "info": ACCENT,
+            "warning": QColor(230, 150, 40),
+            "error": QColor(200, 60, 50),
+        }
+        for text, level, _expiry in self._toasts:
+            border = border_by_level.get(level, ACCENT)
+            text_w = metrics.horizontalAdvance(text)
+            box_w = text_w + 32
+            box_h = metrics.height() + 16
+            box_x = (w - box_w) // 2
+            box_rect = QRect(box_x, toast_y, box_w, box_h)
+            painter.setPen(QPen(border, 2))
+            painter.setBrush(TILE_BG)
+            painter.drawRoundedRect(box_rect, 8, 8)
+            painter.setPen(TILE_TEXT)
+            painter.drawText(box_rect, Qt.AlignmentFlag.AlignCenter, text)
+            toast_y += box_h + 8
 
         if self.cursor_px is None:
             return
@@ -1044,6 +1087,19 @@ class GazeInteractionController(QObject):
         self.overlay.mode_name = self.mode.name
         self.overlay.show()
         self.mode.enter()
+
+        self.keyboard.floor_unmet_changed.connect(self._on_floor_unmet_changed)
+        if self.keyboard._floor_unmet:
+            # The window's own __init__ already laid out tiles (and would
+            # have emitted the signal) before this connect existed.
+            self._on_floor_unmet_changed(True)
+
+    def notify(self, text: str, level: str = "info") -> None:
+        self.overlay.notify(text, level)
+
+    def _on_floor_unmet_changed(self, floor_unmet: bool) -> None:
+        if floor_unmet:
+            self.notify("Keyboard below accuracy floor - consider recalibrating", "warning")
 
     # lifecycle
 
