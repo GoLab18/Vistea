@@ -18,6 +18,7 @@ Structure:
   read instead of type).
 - ``BrowserBar`` - side strip for navigation mode: back/forward/page
   up/down, switch to keyboard, exit.
+- ``SuggestionBar`` - prefix word-completion strip docked against the keyboard, one-dwell accept + save to the user's dictionary.
 - Modes (State Pattern behind the ``GazeMode`` Protocol): ``KeyboardMode``
   types into the OS-focused field (and mirrors it in the preview strip) and
   feeds drift correction, ``NavigationMode`` dwell-clicks and enables
@@ -67,6 +68,10 @@ from core.fixation import IDTFixationDetector
 from core.gestures import EdgeScrollDetector
 from core.vision import LandmarksData
 
+import pathlib
+
+from core.suggestions import SuggestionEngine
+
 ACCENT = QColor(41, 128, 185)
 ACCENT_ACTIVE = QColor(46, 204, 113)
 TILE_BG = QColor(30, 30, 35, 235)
@@ -75,6 +80,7 @@ LOCK_DIM = QColor(10, 10, 12, 170)
 
 KEY_PREFIX = "key:" # tile ids of character keys: "key:<char>"
 SCREEN_CLICK = "screen:click" # pseudo-target: dwell on bare screen (nav mode)
+SUGG_PREFIX = "sugg:" # tile ids of suggestion tiles: "sugg:<index>"
 
 
 def to_physical(x: int, y: int, dpr: float) -> Tuple[int, int]:
@@ -104,6 +110,7 @@ class Ctl(str, Enum):
     ENTER = "ctl:enter"
     NAV = "ctl:nav"
     EXIT = "ctl:exit"
+    ADD_WORD = "ctl:addword"
 
     # options page
 
@@ -405,6 +412,10 @@ class KeyboardWindow(TileBoardWindow):
         # demands - a tile outside the display is useless.
         cap_w = (geo.width() - 20) // n_cols
         cap_h = (geo.height() - self.BUFFER_H - 20) // n_rows
+
+        if getattr(self, "_reserve_suggestion_row", False):
+            cap_h = (geo.height() - self.BUFFER_H - 20) // (n_rows + 1)
+
         tile = max(self.TILE_ABS_MIN, min(int(base * self.scale), cap_w, cap_h))
 
         floor_unmet = tile < self.min_tile_px
@@ -606,6 +617,112 @@ class BrowserBar(TileBoardWindow):
         self.tiles = [Tile(tid, label, QRect(x0, y0 + i * tile, tile, tile)) for i, (tid, label) in enumerate(self.SPECS)]
 
 
+class SuggestionBar(TileBoardWindow):
+    """Strip of prefix word-completion tiles docked against the keyboard.
+
+    Three suggestion tiles carry the current top completions and a fourth,
+    fixed ``ADD_WORD`` tile saves the typed word (or phrase) to the user's
+    dictionary. The bar mirrors the keyboard's tile size so a suggestion is
+    just as reachable by dwell as a key, and it re-docks with the keyboard
+    (above it when bottom-docked, below when top-docked, along the inner edge
+    when side-docked). It only appears on the letters page, where completing a
+    word makes sense.
+    """
+
+    N_SUGGESTIONS = 3
+
+    def __init__(self, screen):
+        super().__init__(screen)
+        self._words: List[str] = []
+        self._rect = QRect(0, 0, 0, 0)
+
+    def _keyboard_tile_px(self, keyboard: "KeyboardWindow") -> int:
+        for tile in keyboard.tiles:
+            if tile.tile_id == Ctl.SPACE:
+                return tile.rect.height()
+        if keyboard.tiles:
+            return keyboard.tiles[0].rect.height()
+        return keyboard.min_tile_px
+
+    def reposition(self, keyboard: "KeyboardWindow") -> None:
+        """Anchor the bar against the keyboard's outer geometry and rebuild
+        the tile row at the keyboard's tile size."""
+
+        board = keyboard.geometry()
+        tile = self._keyboard_tile_px(keyboard)
+        n = self.N_SUGGESTIONS + 1
+
+        if keyboard.dock in (DockSide.BOTTOM, DockSide.TOP):
+            width = board.width()
+            x0 = board.x()
+            if keyboard.dock is DockSide.BOTTOM:
+                y0 = board.y() - tile - 6
+            else:
+                y0 = board.y() + board.height() + 6
+            cell = width // n
+        else:
+            width = tile * n
+            if keyboard.dock is DockSide.LEFT:
+                x0 = board.x() + board.width() + 6
+            else:
+                x0 = board.x() - width - 6
+            y0 = board.y()
+            cell = tile
+
+        # Clamp to the screen so the strip is never cut off at an edge (e.g.
+        # a 4-row PL layout docked top leaves no room above the board).
+        geo = self._screen.geometry()
+        bar_w = cell * n
+        x0 = max(geo.x(), min(x0, geo.x() + geo.width() - bar_w))
+        y0 = max(geo.y(), min(y0, geo.y() + geo.height() - tile))
+        self._rect = QRect(x0, y0, bar_w, tile)
+        self.setGeometry(self._rect.x(), self._rect.y(), self._rect.width(), self._rect.height())
+        self._build_tiles(x0, y0, cell, tile)
+
+    def _build_tiles(self, x0: int, y0: int, cell: int, tile: int) -> None:
+        self.tiles = []
+        x = x0
+        for i in range(self.N_SUGGESTIONS):
+            word = self._words[i] if i < len(self._words) else ""
+            if word: # empty suggestion -> no tile, so it cannot be hit-tested
+                self.tiles.append(Tile(f"{SUGG_PREFIX}{i}", word, QRect(x, y0, cell, tile)))
+            x += cell
+        self.tiles.append(Tile(Ctl.ADD_WORD, "DICT+", QRect(x, y0, cell, tile)))
+        self.update()
+
+    def _paint_tile(self, painter: QPainter, tile: Tile, origin) -> None:
+        """Give suggestion tiles a lightly accented fill so the strip reads as
+        distinct from the keyboard, the fixed DICT+ tile keeps the standard
+        look. Highlight/progress rendering is inherited from the base tile."""
+
+        if tile.tile_id == Ctl.ADD_WORD:
+            super()._paint_tile(painter, tile, origin)
+            return
+        local = tile.rect.translated(-origin.x(), -origin.y()).adjusted(3, 3, -3, -3)
+        active = tile.tile_id == self._highlight
+        painter.setPen(QPen(ACCENT_ACTIVE if active else ACCENT, 3 if active else 1))
+        painter.setBrush(QColor(36, 52, 66, 235))
+        painter.drawRoundedRect(local, 10, 10)
+        if active and self._progress > 0.0:
+            painter.setPen(QPen(ACCENT_ACTIVE, 5))
+            side = min(local.width(), local.height()) - 14
+            arc_rect = QRect(0, 0, side, side)
+            arc_rect.moveCenter(local.center())
+            painter.drawArc(arc_rect, 90 * 16, -int(360 * 16 * self._progress))
+        painter.setPen(TILE_TEXT)
+        painter.drawText(local, Qt.AlignmentFlag.AlignCenter, tile.label)
+
+    def suggestion_word(self, index: int) -> Optional[str]:
+        return self._words[index] if 0 <= index < len(self._words) else None
+
+    def set_suggestions(self, words: List[str]) -> None:
+        self._words = list(words)
+        r = self._rect
+        n = self.N_SUGGESTIONS + 1
+        cell = r.width() // n if r.width() else 0
+        self._build_tiles(r.x(), r.y(), cell, r.height())
+
+
 class GazeOverlay(QWidget):
     """Transparent, click-through fullscreen layer: cursor + feedback."""
 
@@ -678,12 +795,44 @@ class KeyboardMode:
         self.board = keyboard
         self._drift = drift
         self._actuator = actuator
+        root = pathlib.Path(__file__).resolve().parent.parent
+        self.engine = SuggestionEngine(root / "assets" / "dict",
+                                       root / "logs" / "user_dictionary.json")
+        self.suggestions_board = SuggestionBar(keyboard._screen)
+
+        # Reserve a tile row so the suggestion strip always fits above/below
+        # the board without pushing the keyboard off-screen.
+        keyboard._reserve_suggestion_row = True
+        keyboard._layout_tiles()
 
     def enter(self) -> None:
         self.board.show()
+        self._refresh_suggestions()
 
     def exit(self) -> None:
         self.board.hide()
+        self.suggestions_board.hide()
+
+    def _current_prefix(self) -> str:
+        """The word currently being typed: the buffer tail after the last
+        space (empty right after a space or on an empty buffer)."""
+
+        buffer = self.board.buffer
+        cut = buffer.rfind(" ")
+        return buffer[cut + 1:] if cut >= 0 else buffer
+
+    def _refresh_suggestions(self) -> None:
+        """Recompute the suggestion strip for the current prefix and show or
+        hide it with the letters page."""
+
+        bar = self.suggestions_board
+        if self.board.page is not Page.LETTERS:
+            bar.hide()
+            return
+        bar.reposition(self.board)
+        words = self.engine.suggest(self._current_prefix(), self.board.layout.code)
+        bar.set_suggestions(words)
+        bar.show()
 
     def _apply_drift(self, tile_id: str) -> None:
         # Drift correction BEFORE mutating layout: the dwell frames in the
@@ -698,6 +847,33 @@ class KeyboardMode:
 
     def on_activation(self, tile_id: str) -> Optional[ModeAction]:
         board = self.board
+
+        if tile_id.startswith(SUGG_PREFIX):
+            index = int(tile_id[len(SUGG_PREFIX):])
+            word = self.suggestions_board.suggestion_word(index)
+            if word is not None:
+                prefix = self._current_prefix()
+                for _ in range(len(prefix)):
+                    self._actuator.press_key("backspace")
+                    board.backspace_preview()
+                self._actuator.type_text(word + " ")
+                board.type_preview(word + " ")
+                rlog.event(
+                    "suggestion_accepted",
+                    word=word,
+                    prefix_len=len(prefix),
+                    saved_keystrokes=len(word) - len(prefix),
+                    level=logging.DEBUG
+                )
+                self._refresh_suggestions()
+            return None
+        if tile_id == Ctl.ADD_WORD:
+            buffer = board.buffer.strip()
+            text = buffer if " " in buffer else self._current_prefix()
+            if self.engine.add_custom(text):
+                rlog.event("custom_word_added", text=text, level=logging.DEBUG)
+            return None
+
         if board.locked:
             if tile_id == Ctl.UNLOCK:
                 board.set_locked(False)
@@ -711,18 +887,21 @@ class KeyboardMode:
             ch = tile_id[len(KEY_PREFIX):]
             board.type_preview(ch)
             self._actuator.type_text(ch)
+            self._refresh_suggestions()
         elif tile_id == Ctl.SPACE:
             board.type_preview(" ")
             self._actuator.type_text(" ")
+            self._refresh_suggestions()
         elif tile_id == Ctl.BACKSPACE:
             board.backspace_preview()
             self._actuator.press_key("backspace")
+            self._refresh_suggestions()
         elif tile_id == Ctl.DELETE_WORD:
             board.delete_word_preview()
-
             # Ctrl+Backspace deletes the previous word in most toolkits
             # (macOS uses Alt+Backspace - see the platform notes in README).
             self._actuator.hotkey("ctrl", "backspace")
+            self._refresh_suggestions()
         elif tile_id == Ctl.ENTER:
             text, wpm, elapsed = board.commit_preview()
             rlog.event(
@@ -733,13 +912,17 @@ class KeyboardMode:
             )
             board.committed.emit(text)
             self._actuator.press_key("enter")
+            self._refresh_suggestions()
         elif tile_id == Ctl.PAGE:
             board.toggle_symbols()
+            self._refresh_suggestions()
         elif tile_id == Ctl.OPTIONS:
             board.toggle_options()
+            self._refresh_suggestions()
         elif tile_id == Ctl.LANG:
             code = board.cycle_language()
             rlog.event("keyboard_layout_changed", layout=code)
+            self._refresh_suggestions()
         elif tile_id == Ctl.DOCK_TOP:
             board.set_dock(DockSide.TOP)
         elif tile_id == Ctl.DOCK_BOTTOM:
@@ -758,6 +941,7 @@ class KeyboardMode:
             board.opacity_step(+1)
         elif tile_id == Ctl.CLEAR:
             board.clear_preview()
+            self._refresh_suggestions()
         elif tile_id == Ctl.LOCK:
             board.set_locked(True)
             rlog.event("keyboard_locked", locked=True)
@@ -896,6 +1080,12 @@ class GazeInteractionController(QObject):
             px = self._geo.x() + int(probe[0] * self._geo.width())
             py = self._geo.y() + int(probe[1] * self._geo.height())
             target = self.mode.board.hit_test(px, py)
+
+            if target is None:
+                extra = getattr(self.mode, "suggestions_board", None)
+                if extra is not None and extra.isVisible():
+                    target = extra.hit_test(px, py)
+
             if target is None and self.mode.edge_scroll and self.edge.current_zone == 0:
                 # Navigation mode: dwelling on plain screen is itself a target
                 # (an OS click) - without a pseudo-target the dwell timer
@@ -955,3 +1145,7 @@ class GazeInteractionController(QObject):
         self.overlay.progress = self.activation.progress
         self.overlay.update()
         self.mode.board.set_highlight(target, self.activation.progress)
+
+        extra = getattr(self.mode, "suggestions_board", None)
+        if extra is not None:
+            extra.set_highlight(target, self.activation.progress)

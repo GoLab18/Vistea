@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 
 from core import research_log as rlog
 from core.actuator import NullActuator
+from core.suggestions import SuggestionEngine
 from ui_gaze import (
     BrowserBar,
     Ctl,
@@ -18,6 +19,7 @@ from ui_gaze import (
     ModeAction,
     NavigationMode,
     Page,
+    SUGG_PREFIX,
     to_physical,
 )
 
@@ -333,3 +335,101 @@ def test_page_scroll_parks_cursor_at_screen_centre_first():
     mode.on_activation(Ctl.PAGE_DOWN)
     assert act.calls[0] == ("move", 1440, 810) # centre (960, 540) x 1.5
     assert act.calls[1] == ("scroll", -12)
+
+
+# suggestions
+
+@pytest.fixture
+def sugg_mode(kb, tmp_path):
+    # keep the engine off the real assets/logs: a tiny corpus + tmp custom file
+    dict_dir = tmp_path / "dict"
+    dict_dir.mkdir()
+    (dict_dir / "en_50k.txt").write_text("the 100\nthen 80\nthere 60\n", encoding="utf-8")
+    m = KeyboardMode(kb, None, NullActuator())
+    m.engine = SuggestionEngine(dict_dir, tmp_path / "custom.json")
+    return m
+
+
+def test_suggestion_bar_populates_on_letters_page(kb, sugg_mode):
+    kb.type_preview("the")
+    sugg_mode._refresh_suggestions()
+    labels = [t.label for t in sugg_mode.suggestions_board.tiles]
+    assert "then" in labels and "there" in labels
+    assert "DICT+" in labels
+
+
+def test_accepting_suggestion_replaces_prefix_in_field_and_buffer(kb, sugg_mode):
+    for ch in "the":
+        sugg_mode.on_activation(f"{KEY_PREFIX}{ch}")
+    act = sugg_mode._actuator
+    act.calls.clear()
+    sugg_mode.on_activation(f"{SUGG_PREFIX}0") # accept top suggestion "then"
+
+    # 3 backspaces (len prefix) then the whole word + trailing space
+    assert act.calls.count(("press_key", "backspace")) == 3
+    assert ("type_text", "then ") in act.calls
+    assert kb.buffer == "then "
+
+
+def test_add_word_saves_current_word_to_custom(kb, sugg_mode, tmp_path):
+    for ch in "hello":
+        kb.type_preview(ch)
+    sugg_mode.on_activation(Ctl.ADD_WORD)
+    reloaded = SuggestionEngine(tmp_path / "dict", tmp_path / "custom.json")
+    assert reloaded.suggest("hel", "EN", k=3) == ["hello"]
+
+
+def test_add_word_saves_whole_buffer_when_multiword(kb, sugg_mode, tmp_path):
+    for ch in "hi there":
+        kb.type_preview(ch)
+    sugg_mode.on_activation(Ctl.ADD_WORD)
+    reloaded = SuggestionEngine(tmp_path / "dict", tmp_path / "custom.json")
+    assert reloaded.suggest("hi", "EN", k=3)[0] == "hi there"
+
+
+def test_suggestion_bar_hidden_off_letters_page(kb, sugg_mode):
+    kb.switch_page(Page.SYMBOLS)
+    sugg_mode._refresh_suggestions()
+    assert not sugg_mode.suggestions_board.isVisible()
+
+
+def test_suggestion_tiles_are_hit_testable(kb, sugg_mode):
+    kb.type_preview("the")
+    sugg_mode._refresh_suggestions()
+    bar = sugg_mode.suggestions_board
+    tile = next(t for t in bar.tiles if t.tile_id == f"{SUGG_PREFIX}0")
+    c = tile.rect.center()
+    assert bar.hit_test(c.x(), c.y()) == f"{SUGG_PREFIX}0"
+
+
+def test_reserved_suggestion_row_keeps_board_plus_strip_on_screen(kb):
+    # With the row reserved and the tall PL layout (4 letter rows), the board
+    # plus one extra tile row (the suggestion strip) must fit the screen.
+    geo = FakeScreen().geometry()
+    kb.cycle_language() # -> PL
+    assert kb.layout.code == "PL"
+    kb._reserve_suggestion_row = True
+    kb._layout_tiles()
+    tile = next(t for t in kb.tiles if t.tile_id == Ctl.SPACE).rect.height()
+    board = kb.geometry()
+    assert board.y() >= geo.y()
+    assert board.y() + board.height() <= geo.y() + geo.height() + 1
+
+    # The reserve keeps the board short enough that the board plus one extra
+    # tile row (the suggestion strip) fits within the screen height.
+    assert board.height() + tile <= geo.height() + 1
+
+
+def test_suggestion_bar_never_extends_past_screen_edges(kb, sugg_mode):
+    # Top-docked PL: the strip would sit above the board, clamp keeps it on
+    # screen instead of being cut off at the top edge.
+    geo = FakeScreen().geometry()
+    kb.cycle_language() # -> PL
+    kb.set_dock(DockSide.TOP)
+    kb.type_preview("the")
+    sugg_mode._refresh_suggestions()
+    r = sugg_mode.suggestions_board.geometry()
+    assert r.x() >= geo.x()
+    assert r.y() >= geo.y()
+    assert r.x() + r.width() <= geo.x() + geo.width() + 1
+    assert r.y() + r.height() <= geo.y() + geo.height() + 1
