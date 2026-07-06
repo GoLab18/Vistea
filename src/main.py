@@ -20,8 +20,10 @@ from PySide6.QtWidgets import (
 )
 
 from core import research_log as rlog
+from core.activation import ACTIVATION_REGISTRY
+from core.actuator import make_actuator
 from core.preprocessing import PREPROCESSOR_FACTORIES, LIGHTING_CONDITIONS
-from core.vision import GazeEstimator, LandmarksData, build_feature_vector  # [ITER3] build_feature_vector
+from core.vision import GazeEstimator, LandmarksData, build_feature_vector
 from core.filters import OneEuroFilter, PointFilter
 from core.head_pose import HeadPoseMonitor
 from core.calibration import (
@@ -33,6 +35,7 @@ from core.calibration import (
     Segment,
 )
 from core.evaluation import ValidationReport, compute_point_error
+from ui_gaze import GazeInteractionController
 
 # Number of valid (non-blink) frames captured per STATIC calibration target.
 # At ~30 FPS this is roughly one second of fixation per point.
@@ -90,13 +93,13 @@ class CalibrationOverlay(QWidget):
     Frameless full-screen calibration surface - a generic interpreter of the
     strategy's calibration plan (Plan-as-Data, see core.calibration.Segment).
 
-    Static segments: targets are rendered at their true on-screen positions;
+    Static segments: targets are rendered at their true on-screen positions,
     for every target the user fixates the dot and presses SPACE, then
     SAMPLES_PER_POINT valid frames are recorded (blinks rejected upstream)
     behind a progress ring, with quality gating on the batch spread.
 
     Pursuit segments: SPACE starts a smooth sweep of the target along the
-    declared trajectory; every valid frame is collected continuously and
+    declared trajectory, every valid frame is collected continuously and
     labelled with the trajectory position PURSUIT_LAG_S seconds BEFORE the
     capture instant (clock-based oculomotor-lag compensation, exact under
     camera FPS jitter).
@@ -458,6 +461,15 @@ class MainWindow(QMainWindow):
         self.prep_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         controls.addWidget(self.prep_box, stretch=2)
 
+        lbl_activation = QLabel("Activation:")
+        lbl_activation.setStyleSheet("font-weight: bold;")
+        controls.addWidget(lbl_activation)
+
+        self.activation_box = QComboBox()
+        self.activation_box.addItems(ACTIVATION_REGISTRY.keys())
+        self.activation_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        controls.addWidget(self.activation_box, stretch=2)
+
         self.btn_calibrate = QPushButton("Start Calibration")
         self.btn_calibrate.setStyleSheet(
             "background-color: #2980b9; color: white; font-weight: bold; padding: 10px;"
@@ -465,6 +477,15 @@ class MainWindow(QMainWindow):
         self.btn_calibrate.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_calibrate.clicked.connect(self.start_calibration)
         controls.addWidget(self.btn_calibrate)
+
+        self.btn_gaze = QPushButton("Gaze Mode")
+        self.btn_gaze.setStyleSheet(
+            "background-color: #27ae60; color: white; font-weight: bold; padding: 10px;"
+        )
+        self.btn_gaze.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_gaze.setEnabled(False) # requires a calibrated model
+        self.btn_gaze.clicked.connect(self.start_gaze_mode)
+        controls.addWidget(self.btn_gaze)
 
         self.btn_reset = QPushButton("Reset")
         self.btn_reset.setStyleSheet(
@@ -480,6 +501,8 @@ class MainWindow(QMainWindow):
         self.overlay: Optional[CalibrationOverlay] = None
         self.head_monitor: Optional[HeadPoseMonitor] = None
         self._pose_ok = True
+        self.gaze_controller: Optional[GazeInteractionController] = None
+        self.mean_error_px: Optional[float] = None
 
         # Output smoothing (screen-space): tuned per Casiez et al. procedure.
         self.gaze_filter: PointFilter = OneEuroFilter(min_cutoff=0.8, beta=0.5)
@@ -510,6 +533,8 @@ class MainWindow(QMainWindow):
         self.latest_gaze = None
         self.head_monitor = None
         self._pose_ok = True
+        self.btn_gaze.setEnabled(False)
+        self.mean_error_px = None
 
         rlog.bind(
             session_id=rlog.new_session_id(),
@@ -539,6 +564,8 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(
             "font-size: 15px; font-weight: bold; color: #2ecc71; padding: 8px;"
         )
+        self.mean_error_px = report.mean_error_px
+        self.btn_gaze.setEnabled(True)
 
     @Slot()
     def on_calibration_aborted(self):
@@ -552,13 +579,49 @@ class MainWindow(QMainWindow):
             self.overlay = None
 
     def reset_calibration(self):
+        self.stop_gaze_mode()
         self.strategy = None
         self.latest_gaze = None
         self.head_monitor = None
         self._pose_ok = True
+        self.mean_error_px = None
+        self.btn_gaze.setEnabled(False)
         self.gaze_filter.reset()
         self.status_label.setText("Calibration cleared. Choose a strategy and start calibration.")
         self.status_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
+
+    # gaze mode
+
+    def start_gaze_mode(self):
+        if self.strategy is None or not self.strategy.is_calibrated():
+            return
+        activation = ACTIVATION_REGISTRY[self.activation_box.currentText()]()
+        self.gaze_controller = GazeInteractionController(
+            self.strategy,
+            self._screen,
+            activation,
+            make_actuator(),
+            self.mean_error_px,
+        )
+        self.gaze_controller.stopped.connect(self.on_gaze_mode_stopped)
+        # The main window leaves the stage: the gaze UI overlays the user's
+        # own applications, not this control panel. EXIT on the keyboard or
+        # the browser bar brings it back.
+        self.showMinimized()
+
+    def stop_gaze_mode(self):
+        if self.gaze_controller is not None:
+            self.gaze_controller.stop()
+
+    @Slot()
+    def on_gaze_mode_stopped(self):
+        self.gaze_controller = None
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.status_label.setText("Gaze mode ended. You can recalibrate or start it again.")
+
+    # head pose
 
     def _check_head_pose(self, data: LandmarksData) -> bool:
         """Virtual chinrest: freeze the cursor and warn while the head has
@@ -598,18 +661,26 @@ class MainWindow(QMainWindow):
     @Slot(np.ndarray, object)
     def update_ui(self, frame: np.ndarray, data: LandmarksData):
         pose_ok = self._check_head_pose(data)
+        vec = None
         if (
             self.strategy is not None
             and self.strategy.is_calibrated()
             and data.gaze_valid
-            and pose_ok # pause the cursor while drifted
         ):
             vec = build_feature_vector(data, use_head_pose=getattr(self.strategy, "use_head_pose", False))
-            if vec is not None:
+            if vec is not None and pose_ok: # pause the cursor while drifted
                 raw = self.strategy.predict(vec)
                 if raw is not None:
                     fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
                     self.latest_gaze = NormalizedPoint(fx, fy)
+
+        if self.gaze_controller is not None:
+            # The virtual chinrest gates gaze interaction too: while the head
+            # has drifted, the controller receives no gaze point, so dwell
+            # progress freezes (grace period) instead of accumulating on a
+            # mislocated target.
+            gaze = self.latest_gaze if pose_ok else None
+            self.gaze_controller.on_gaze(gaze, data, vec)
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
@@ -637,6 +708,7 @@ class MainWindow(QMainWindow):
         self.video_label.setPixmap(scaled)
 
     def closeEvent(self, event):
+        self.stop_gaze_mode()
         self.camera_thread.stop()
         super().closeEvent(event)
 
