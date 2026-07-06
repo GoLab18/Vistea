@@ -372,7 +372,7 @@ class HybridCalibration(_RidgeMixin):
         self._init_model(alpha, degree)
 
     def target_sequence(self) -> List[NormalizedPoint]:
-        # Anchors + nominal pursuit waypoints (used for grid_size logging).
+        # Anchors + nominal pursuit waypoints (used for grid_size logging)
         return list(self._grid) + make_lissajous(60)
 
     def plan(self) -> List[Segment]:
@@ -389,17 +389,17 @@ def _set_name(strategy, name: str):
     return strategy
 
 
-DEFAULT_STRATEGY_KEY: Final[str] = "Ridge 9-pt (default)"
+DEFAULT_STRATEGY_KEY: Final[str] = "Ridge 9-pt + pose (default)"
 
 # Registry using factory lambdas to allow injecting distinct grid sizes
 STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
     "Ridge 5-pt": lambda: _set_name(PolynomialRidgeCalibration(grid=make_5point()), "ridge_poly2_5pt"),
-    DEFAULT_STRATEGY_KEY: lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(3)), "ridge_poly2_9pt"),
+    "Ridge 9-pt": lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(3)), "ridge_poly2_9pt"),
     "Ridge 16-pt": lambda: _set_name(PolynomialRidgeCalibration(grid=make_grid(4)), "ridge_poly2_16pt"),
     "Homography (9-pt)": lambda: _set_name(HomographyCalibration(grid=make_grid(3)), "homography_9pt"),
     "Smooth Pursuit (24 s)": lambda: SmoothPursuitCalibration(),
     "Hybrid 9-pt + Pursuit": lambda: HybridCalibration(),
-    "Ridge 9-pt + pose": lambda: _set_name(
+    DEFAULT_STRATEGY_KEY: lambda: _set_name(
         PolynomialRidgeCalibration(grid=make_grid(3), use_head_pose=True), "ridge_poly2_9pt_pose"
     ),
     "Hybrid + pose": lambda: _set_name(HybridCalibration(use_head_pose=True), "hybrid_9pt_pursuit_pose"),
