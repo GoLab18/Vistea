@@ -128,6 +128,63 @@ class Ctl(str, Enum):
     KEYBOARD = "ctl:kbd"
 
 
+import pathlib
+
+ICON_FILES: Dict[str, str] = {
+    Ctl.BACK: "arrow-left",
+    Ctl.FORWARD: "arrow-right",
+    Ctl.PAGE_UP: "chevrons-up",
+    Ctl.PAGE_DOWN: "chevrons-down",
+    Ctl.BACKSPACE: "delete",
+    Ctl.ENTER: "corner-down-left",
+    Ctl.EXIT: "x",
+    Ctl.KEYBOARD: "keyboard",
+    Ctl.NAV: "mouse-pointer",
+    Ctl.DOCK_TOP: "arrow-up-to-line",
+    Ctl.DOCK_BOTTOM: "arrow-down-to-line",
+    Ctl.DOCK_LEFT: "arrow-left-to-line",
+    Ctl.DOCK_RIGHT: "arrow-right-to-line",
+    Ctl.LOCK: "lock",
+    Ctl.UNLOCK: "lock-open",
+    Ctl.OPTIONS: "settings",
+    Ctl.CLEAR: "eraser",
+    Ctl.SIZE_UP: "zoom-in",
+    Ctl.SIZE_DOWN: "zoom-out",
+}
+
+ICONS_DIR = pathlib.Path(__file__).resolve().parent.parent / "assets" / "icons"
+
+_ICON_RENDERERS: Dict[str, Optional[object]] = {}
+
+
+def _icon_renderer(tile_id: str) -> Optional[object]:
+    """Lazily build (and cache) a QSvgRenderer for a tile's Lucide icon.
+    Must stay lazy/inside a paint path - scripts/smoke_ui.py stubs Qt (no
+    PySide6.QtSvg module at all) and never runs paintEvent, so the import
+    itself is deferred to this call. A cached None means "no icon for this
+    tile" (missing file / bad SVG / QtSvg unavailable) and short-circuits
+    the disk read and parse on every subsequent repaint."""
+
+    if tile_id in _ICON_RENDERERS:
+        return _ICON_RENDERERS[tile_id]
+    renderer = None
+    name = ICON_FILES.get(tile_id)
+    if name is not None:
+        try:
+            from PySide6.QtCore import QByteArray
+            from PySide6.QtSvg import QSvgRenderer
+            svg_path = ICONS_DIR / f"{name}.svg"
+            data = svg_path.read_text(encoding="utf-8")
+            data = data.replace("currentColor", "#f0f0f0")
+            candidate = QSvgRenderer(QByteArray(data.encode("utf-8")))
+            if candidate.isValid():
+                renderer = candidate
+        except (OSError, ImportError):
+            renderer = None
+    _ICON_RENDERERS[tile_id] = renderer
+    return renderer
+
+
 class ModeAction(Enum):
     """Semantic outcome of a tile activation that the controller must act
     on (everything else is handled inside the mode/board)."""
@@ -234,6 +291,16 @@ class TileBoardWindow(QWidget):
             arc_rect.moveCenter(local.center())
             painter.drawArc(arc_rect, 90 * 16, -int(360 * 16 * self._progress))
         painter.setPen(TILE_TEXT)
+
+        renderer = _icon_renderer(tile.tile_id)
+        if renderer is not None:
+            from PySide6.QtCore import QRectF
+            side = min(local.width(), local.height()) * 0.55
+            icon_rect = QRectF(0, 0, side, side)
+            icon_rect.moveCenter(QRectF(local).center())
+            renderer.render(painter, icon_rect)
+            return
+
         painter.drawText(local, Qt.AlignmentFlag.AlignCenter, tile.label)
 
     def paintEvent(self, event):
@@ -344,8 +411,12 @@ class KeyboardWindow(TileBoardWindow):
         if floor_unmet != self._floor_unmet:
             self._floor_unmet = floor_unmet
             if floor_unmet:
-                rlog.event("keyboard_floor_unmet", tile_px=tile, min_tile_px=self.min_tile_px,
-                           level=logging.WARNING)
+                rlog.event(
+                    "keyboard_floor_unmet",
+                    tile_px=tile,
+                    min_tile_px=self.min_tile_px,
+                    level=logging.WARNING
+                )
 
         board_w = tile * n_cols
         board_h = tile * n_rows + self.BUFFER_H
@@ -654,8 +725,12 @@ class KeyboardMode:
             self._actuator.hotkey("ctrl", "backspace")
         elif tile_id == Ctl.ENTER:
             text, wpm, elapsed = board.commit_preview()
-            rlog.event("text_committed", chars=len(text), elapsed_s=round(elapsed, 1),
-                       wpm=round(wpm, 1))
+            rlog.event(
+                "text_committed",
+                chars=len(text),
+                elapsed_s=round(elapsed, 1),
+                wpm=round(wpm, 1)
+            )
             board.committed.emit(text)
             self._actuator.press_key("enter")
         elif tile_id == Ctl.PAGE:
@@ -833,8 +908,12 @@ class GazeInteractionController(QObject):
         blink = extract_blink_score(data.blendshapes)
         event = self.activation.update(target, fix.fixating, blink, t)
         if event is not None:
-            rlog.event("tile_activated", tile=event.target_id,
-                       kind=event.kind.value, mode=self.mode.name)
+            rlog.event(
+                "tile_activated",
+                tile=event.target_id,
+                kind=event.kind.value,
+                mode=self.mode.name
+            )
             action = self.mode.on_activation(event.target_id)
             if action is ModeAction.EXIT:
                 self.stop()
