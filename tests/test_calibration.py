@@ -1,3 +1,5 @@
+"""Tests for calibration strategies: plans, interpolation, lag compensation, hybrid."""
+
 import math
 
 from core.calibration import (

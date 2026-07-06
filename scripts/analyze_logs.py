@@ -3,7 +3,7 @@
 Usage:
     uv run python scripts/analyze_logs.py [logs/vistea.jsonl]
 
-Reads events from the log (Iteration 1.5) and saves three CSVs alongside it:
+Reads events from the log and saves three CSVs alongside it:
   *_sessions.csv    - one line per session: strategy, grid, mean error
                       (validation_report + context bound with bind()),
   *_points.csv      - error per validation point (validation_point) - data

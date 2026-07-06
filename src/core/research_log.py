@@ -177,8 +177,8 @@ def sample_spread(features_batch: Any) -> Optional[float]:
 
     RMS of the per-feature-dimension standard deviations of the batch. High
     value = the samples for this target disagreed with one another (micro head
-    movement, attention drift) — exactly the number Iteration 2's quality
-    gating thresholds on. Returns ``None`` for an empty/degenerate batch.
+    movement, attention drift) — exactly the number the calibration
+    quality gating thresholds on. Returns ``None`` for an empty/degenerate batch.
     """
 
     import numpy as np

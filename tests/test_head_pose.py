@@ -1,3 +1,5 @@
+"""Tests for head pose decomposition, 4D/7D feature vectors and chinrest monitor."""
+
 import math
 
 import numpy as np
@@ -62,7 +64,7 @@ def test_feature_vector_dimensions():
 
 def test_pose_features_reduce_yaw_error():
     """
-    Synthetic head-rotation experiment (ROADMAP criterion): the true screen
+    Synthetic head-rotation experiment: the true screen
     position depends on PC-EC features AND on yaw (turning the head while
     fixating the same point shifts the projected iris geometry). Calibration
     covers slight head motion; evaluation happens at a yaw the 4D model must
