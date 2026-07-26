@@ -1,7 +1,7 @@
 [project]
 name = "vistea"
 version = "0.1.0"
-description = "Low-cost gaze tracking system"
+description = "Low-cost gaze tracking and control system"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
