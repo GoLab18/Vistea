@@ -17,7 +17,6 @@ The console prints the strategy aggregate (preview without opening CSVs).
 from __future__ import annotations
 
 import sys
-
 import pandas as pd
 
 
@@ -25,11 +24,11 @@ def main(path: str = "logs/vistea.jsonl") -> None:
     df = pd.read_json(path, lines=True)
     base = path.rsplit(".", 1)[0]
 
-    # per session: validation reports with session context
     rep = df[df["event"] == "validation_report"].copy()
     if rep.empty:
         print("No validation_report events found in", path)
         return
+
     session_cols = [
         c for c in (
             "timestamp", "session_id", "strategy", "grid_size",
@@ -40,7 +39,6 @@ def main(path: str = "logs/vistea.jsonl") -> None:
     sessions = rep[session_cols].sort_values("timestamp")
     sessions.to_csv(f"{base}_sessions.csv", index=False)
 
-    # per point: validation errors (heatmap / bias)
     pts = df[df["event"] == "validation_point"].copy()
     if not pts.empty:
         pts["px_x"] = pts["point"].str[0]
@@ -59,7 +57,6 @@ def main(path: str = "logs/vistea.jsonl") -> None:
         )
         print("\nError per validation point (deg):\n", per_point.to_string())
 
-    # aggregate: strategy x grid (core of the "Tests" chapter)
     group_keys = [k for k in ("strategy", "grid_size") if k in rep.columns]
     agg = (
         rep.groupby(group_keys)["mean_error_deg"]

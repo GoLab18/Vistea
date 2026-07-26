@@ -11,7 +11,6 @@ error in degrees (n sessions in parentheses). The same CSV file lands next to th
 from __future__ import annotations
 
 import sys
-
 import pandas as pd
 
 
@@ -21,6 +20,7 @@ def main(path: str = "logs/vistea.jsonl") -> None:
     if rep.empty:
         print("No validation_report events in", path)
         return
+
     for col, default in (("lighting_condition", "unknown"), ("preprocessing", "none")):
         if col not in rep:
             rep[col] = default
