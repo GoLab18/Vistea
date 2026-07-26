@@ -1,0 +1,35 @@
+
+# <type>[optional scope]: <summary>
+# summary: max 50 chars, imperative mood ("add", not "added"), no period.
+#
+# Remember about a blank line between the title and the body.
+
+# Body: WHAT changed and WHY - not HOW. Wrap lines at 72 chars.
+# Delete this section if the summary already says everything.
+#
+# |--------------------- body: wrap at 72 chars ----------------------|
+
+
+# Footer (optional):
+#   BREAKING CHANGE: <description of the break and migration>
+#   Refs: #<issue>
+#
+# ---- Types ----
+# feat      new user-facing capability
+# fix       bug fix
+# perf      performance improvement
+# refactor  code change that is neither feat nor fix
+# test      adding or fixing tests only
+# build     dependencies, toolchain (e.g. uv)
+# docs      documentation only
+# chore     maintenance, housekeeping, configuration
+# ci        CI/CD configuration
+# style     formatting only, no logic
+#
+# ---- Vistea scopes ----
+# vision | calibration | activation | gestures | suggestions
+# appearance | workarea | ui | interaction | logging | evaluation 
+# tests | scripts | deps | core
+#
+# Rules: lowercase summary, no trailing period, ONE logical change
+# per commit. If the summary needs "and", split the commit.
