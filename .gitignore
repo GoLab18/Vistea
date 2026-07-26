@@ -19,5 +19,3 @@ desktop.ini
 *.log
 .env
 logs/
-
-models/
