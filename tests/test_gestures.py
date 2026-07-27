@@ -1,16 +1,18 @@
-"""Edge scroll detector (EdgeScrollDetector) tests, including grace."""
+"""Edge scroll detector tests, including grace."""
 
-from core.gestures import EdgeScrollDetector
+from __future__ import annotations
+
+from core.gestures import SCROLL_NONE, EdgeScrollDetector
 
 
-def test_glance_shorter_than_entry_delay_never_scrolls():
+def test_glance_shorter_than_entry_delay_never_scrolls() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.4)
     ticks = sum(det.update(0.05, t * 0.05) for t in range(7)) # 0.30 s in zone
     ticks += det.update(0.5, 0.40) # leaves
     assert ticks == 0
 
 
-def test_scroll_arms_after_entry_delay_and_ticks_at_interval():
+def test_scroll_arms_after_entry_delay_and_ticks_at_interval() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.4, tick_interval=0.12)
     total = 0
     t = 0.0
@@ -23,7 +25,7 @@ def test_scroll_arms_after_entry_delay_and_ticks_at_interval():
     assert det.active
 
 
-def test_bottom_zone_scrolls_down():
+def test_bottom_zone_scrolls_down() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.1, tick_interval=0.1)
     total = 0
     t = 0.0
@@ -33,7 +35,7 @@ def test_bottom_zone_scrolls_down():
     assert total < 0
 
 
-def test_hysteresis_boundary_jitter_does_not_toggle():
+def test_hysteresis_boundary_jitter_does_not_toggle() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.1, tick_interval=0.1, hysteresis=0.05)
     t = 0.0
     while t <= 0.3: # arm inside the zone
@@ -41,29 +43,32 @@ def test_hysteresis_boundary_jitter_does_not_toggle():
         t += 0.02
     assert det.active
 
-    # jitter just OUTSIDE the entry boundary but INSIDE zone+hysteresis
+    # jitter just outside the entry boundary but inside zone + hysteresis
     ticks = 0
     while t <= 1.0:
         ticks += det.update(0.15, t)  # 0.12 < 0.15 < 0.17
         t += 0.02
     assert det.active and ticks > 0 # kept scrolling through the jitter
+
     det.update(0.30, t) # clearly out
     assert not det.active
 
 
-def test_lost_gaze_resets_gesture():
+def test_lost_gaze_resets_gesture() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.1, grace=0.3)
     t = 0.0
     while t <= 0.3:
         det.update(0.05, t)
         t += 0.02
     assert det.active
+
     det.update(None, 0.35) # fade begins
     det.update(None, 0.75) # fade exceeds grace -> full reset
-    assert not det.active and det.current_zone == 0
+
+    assert not det.active and det.current_zone == SCROLL_NONE
 
 
-def test_brief_signal_loss_during_active_scroll_freezes_without_burst():
+def test_brief_signal_loss_during_active_scroll_freezes_without_burst() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.1, tick_interval=0.1, grace=0.3)
     t = 0.0
     while t <= 0.3: # arm and activate
@@ -83,7 +88,7 @@ def test_brief_signal_loss_during_active_scroll_freezes_without_burst():
     assert det.active
 
 
-def test_brief_signal_loss_during_arming_freezes_entry_delay():
+def test_brief_signal_loss_during_arming_freezes_entry_delay() -> None:
     det = EdgeScrollDetector(zone=0.12, entry_delay=0.4, grace=0.3)
     t = 0.0
     while t <= 0.2: # inside the zone, not yet armed

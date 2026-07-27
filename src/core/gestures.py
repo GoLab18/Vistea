@@ -1,83 +1,92 @@
-"""Edge-zone scroll gestures.
+"""
+Edge-zone scroll gestures for navigation mode.
 
-Fixating in the top/bottom band of the screen emulates mouse-wheel scrolling.
-Three guards address the Midas touch problem for a *zone* target (which,
-unlike a tile, is huge and trivially entered by accident):
-
-- **Entry delay**: the gaze must stay inside the zone for ``entry_delay``
-  seconds before the first scroll tick - glancing at the top of a page does
-  not scroll it.
-- **Hysteresis**: once scrolling is active the zone boundary moves OUTWARD by
-  ``hysteresis`` for the purpose of *leaving* it, so gaze jitter exactly on
-  the boundary cannot rapidly toggle the gesture on and off.
-- **Grace**: a momentary loss of signal (``y`` is ``None`` for less than
-  ``grace`` seconds) freezes the zone state instead of resetting it - the
-  gesture picks up where it left off once the signal returns, with no burst
-  of catch-up ticks and no free progress toward arming.
-
-The detector is Qt-free and clock-driven: ``update(y, t)`` returns the number
-of wheel ticks to emit this frame (signed: +1 scroll up per tick in the top
-zone, -1 down in the bottom zone), which the UI layer forwards to the system
-actuator.
+Converts gaze fixations at the top/bottom of the screen into OS scroll wheel events,
+incorporating hysteresis and blink-resilience to prevent the Midas touch problem.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Final, Literal
+
+type ScrollDirection = Literal[-1, 0, 1]
+
+SCROLL_UP: Final[ScrollDirection] = 1
+SCROLL_DOWN: Final[ScrollDirection] = -1
+SCROLL_NONE: Final[ScrollDirection] = 0
 
 
 class EdgeScrollDetector:
+    """
+    Detects intentional gaze dwells in the screen's margin zones to emit scroll ticks.
+    """
+
     def __init__(
         self,
-        zone: float = 0.12,          # band height, fraction of screen
-        entry_delay: float = 0.4,    # seconds inside the band before ticking
-        tick_interval: float = 0.12, # seconds between wheel ticks while active
-        hysteresis: float = 0.05,    # extra band depth required to LEAVE
-        grace: float = 0.3,          # seconds of lost signal tolerated before reset
-    ):
+        zone: float = 0.12,          # Band height as a fraction of the screen (0.0 to 1.0)
+        entry_delay: float = 0.4,    # Seconds required inside the band before arming
+        tick_interval: float = 0.12, # Seconds between consecutive wheel ticks while active
+        hysteresis: float = 0.05,    # Extra band depth added to the exit boundary (prevents boundary jitter)
+        grace: float = 0.3,          # Seconds of signal loss tolerated without resetting the gesture
+    ) -> None:
         self.zone = zone
         self.entry_delay = entry_delay
         self.tick_interval = tick_interval
         self.hysteresis = hysteresis
         self.grace = grace
-        self.reset()
+
+        self._zone_sign: ScrollDirection = SCROLL_NONE 
+        self._entered_at: float | None = None
+        self._active: bool = False
+        self._last_tick: float | None = None
+        self._lost_since: float | None = None
 
     def reset(self) -> None:
-        self._zone_sign = 0 # +1 top, -1 bottom, 0 none
-        self._entered_at: Optional[float] = None
+        """Fully resets the gesture state machine."""
+
+        self._zone_sign = SCROLL_NONE 
+        self._entered_at = None
         self._active = False
-        self._last_tick: Optional[float] = None
-        self._lost_since: Optional[float] = None
+        self._last_tick = None
+        self._lost_since = None
 
     @property
     def active(self) -> bool:
+        """Returns True if the user is currently scrolling."""
+
         return self._active
 
     @property
-    def current_zone(self) -> int:
+    def current_zone(self) -> ScrollDirection:
         return self._zone_sign
 
-    def _classify(self, y: float, expanded: bool) -> int:
+    def _classify(self, y: float, expanded: bool) -> ScrollDirection:
+        """
+        Classifies the Y coordinate into a zone.
+        Applies hysteresis (expanded margin) if the gesture is already active.
+        """
+
         margin = self.zone + (self.hysteresis if expanded else 0.0)
         if y <= margin:
-            return +1
+            return SCROLL_UP
         if y >= 1.0 - margin:
-            return -1
-        return 0
+            return SCROLL_DOWN
+        return SCROLL_NONE
 
-    def update(self, y: Optional[float], t: float) -> int:
+    def update(self, y: float | None, t: float) -> int:
+        """
+        Updates the gesture state machine and returns the number of scroll ticks to emit.
+        """
+
         if y is None:
             if self._lost_since is None:
                 self._lost_since = t
             if t - self._lost_since <= self.grace:
-                return 0 # signal freeze: state preserved, no ticks
+                return 0
             self.reset()
             return 0
 
         if self._lost_since is not None:
-            # Signal returned within grace: shift the clocks forward by the
-            # fade duration so it counts toward neither entry_delay nor a
-            # backlog of ticks.
             lost_for = t - self._lost_since
             if self._entered_at is not None:
                 self._entered_at += lost_for
@@ -86,15 +95,15 @@ class EdgeScrollDetector:
             self._lost_since = None
 
         sign = self._classify(y, expanded=self._active)
+
         if sign != self._zone_sign:
-            # Zone changed (entered / left / jumped across): re-arm.
             self._zone_sign = sign
-            self._entered_at = t if sign != 0 else None
+            self._entered_at = t if sign != SCROLL_NONE else None
             self._active = False
             self._last_tick = None
             return 0
 
-        if sign == 0 or self._entered_at is None:
+        if sign == SCROLL_NONE or self._entered_at is None:
             return 0
 
         if not self._active:
@@ -102,10 +111,11 @@ class EdgeScrollDetector:
                 return 0
             self._active = True
             self._last_tick = t
-            return sign # first tick fires immediately on arming
+            return sign
 
         ticks = 0
         while self._last_tick is not None and t - self._last_tick >= self.tick_interval:
             self._last_tick += self.tick_interval
             ticks += sign
+
         return ticks

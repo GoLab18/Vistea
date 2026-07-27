@@ -15,7 +15,7 @@ from typing import Final, Literal, Protocol, runtime_checkable
 
 from core import research_log as rlog
 
-DockEdge = Literal["top", "bottom", "left", "right"]
+type DockEdge = Literal["top", "bottom", "left", "right"]
 
 
 @runtime_checkable

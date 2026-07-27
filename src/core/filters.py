@@ -1,21 +1,22 @@
+"""Coordinate smoothing filters for gaze stabilization."""
+
+from __future__ import annotations
+
 import math
-from typing import Tuple, Optional, Protocol
+from typing import Protocol
 
 
 class PointFilter(Protocol):
     """Protocol defining the interface for coordinate smoothing filters."""
 
-    def filter(self, current_point: Tuple[float, float], timestamp_ms: int) -> Tuple[float, float]:
-        ...
-
-    def reset(self) -> None:
-        ...
+    def filter(self, current_point: tuple[float, float], timestamp_ms: int) -> tuple[float, float]: ...
+    def reset(self) -> None: ...
 
 
 class NoFilter:
-    """Pass-through strategy - useful as an experimental baseline."""
+    """Pass-through strategy used as an experimental baseline."""
 
-    def filter(self, current_point: Tuple[float, float], timestamp_ms: int) -> Tuple[float, float]:
+    def filter(self, current_point: tuple[float, float], timestamp_ms: int) -> tuple[float, float]:
         return current_point
 
     def reset(self) -> None:
@@ -25,14 +26,14 @@ class NoFilter:
 class EMAFilter:
     """Applies a simple Exponential Moving Average low-pass filter."""
 
-    def __init__(self, alpha: float = 0.5):
+    def __init__(self, alpha: float = 0.5) -> None:
         self.alpha = alpha
-        self._prev: Optional[Tuple[float, float]] = None
+        self._prev: tuple[float, float] | None = None
 
     def reset(self) -> None:
         self._prev = None
 
-    def filter(self, current_point: Tuple[float, float], timestamp_ms: int) -> Tuple[float, float]:
+    def filter(self, current_point: tuple[float, float], timestamp_ms: int) -> tuple[float, float]:
         if self._prev is None:
             self._prev = current_point
             return current_point
@@ -46,39 +47,34 @@ class EMAFilter:
 
 class OneEuroFilter:
     """
-    Applies the 1 Euro Filter algorithm for noisy input.
-    Paper: Casiez et al., "1 Euro Filter: A Simple Speed-based Low-pass Filter
-    for Noisy Input in Interactive Systems" (CHI 2012).
-
-    The filter is applied to the *predicted gaze point* in normalized screen
-    coordinates (0-1), not to the raw iris features. In these units a saccade
-    across the screen produces velocities of several units per second, which
-    gives the speed term (beta * |v|) a meaningful dynamic range. Tuning
-    procedure recommended by the authors:
-      1. Set beta = 0 and adjust min_cutoff until jitter disappears during
-         a steady fixation.
-      2. Increase beta until lag disappears during fast gaze shifts.
+    Applies the 1 Euro Filter algorithm (Casiez et al., 2012).
+    
+    Dynamically adjusts the cutoff frequency based on movement speed:
+    - Heavy filtering at low speeds to eliminate jitter (controlled by min_cutoff).
+    - Light filtering at high speeds to eliminate latency during saccades (controlled by beta).
+    Designed to operate on normalized screen coordinates (0.0 - 1.0).
     """
 
-    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.5, d_cutoff: float = 1.0):
+    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.5, d_cutoff: float = 1.0) -> None:
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
 
-        self._prev_point: Optional[Tuple[float, float]] = None
-        self._dx_prev: Tuple[float, float] = (0.0, 0.0)
-        self._prev_timestamp_ms: Optional[int] = None
+        self._prev_point: tuple[float, float] | None = None
+        self._dx_prev: tuple[float, float] = (0.0, 0.0)
+        self._prev_timestamp_ms: int | None = None
 
     def reset(self) -> None:
         self._prev_point = None
         self._dx_prev = (0.0, 0.0)
         self._prev_timestamp_ms = None
 
-    def _get_alpha(self, cutoff: float, dt: float) -> float:
+    @staticmethod
+    def _get_alpha(cutoff: float, dt: float) -> float:
         tau = 1.0 / (2.0 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
-    def filter(self, current_point: Tuple[float, float], timestamp_ms: int) -> Tuple[float, float]:
+    def filter(self, current_point: tuple[float, float], timestamp_ms: int) -> tuple[float, float]:
         if self._prev_point is None or self._prev_timestamp_ms is None:
             self._prev_point = current_point
             self._prev_timestamp_ms = timestamp_ms

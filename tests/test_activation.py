@@ -1,5 +1,7 @@
 """Activation strategy tests: dwell, blink, ActivationKind, and telemetry serialization."""
 
+from __future__ import annotations
+
 import json
 
 from core.activation import (
@@ -12,9 +14,7 @@ from core.activation import (
 )
 
 
-# dwell
-
-def test_dwell_fires_after_dwell_time_and_reports_progress():
+def test_dwell_fires_after_dwell_time_and_reports_progress() -> None:
     act = DwellActivation(dwell_time=1.0, cooldown=0.5)
     fired = []
     for i in range(60):  # 60 frames x 25 ms = 1.5 s
@@ -27,9 +27,7 @@ def test_dwell_fires_after_dwell_time_and_reports_progress():
     assert 0.95 <= t_fire <= 1.1
 
 
-def test_dwell_repeats_in_place_after_cooldown_and_repeat_dwell():
-    # First activation: plain dwell_time (0.5 s). The gaze never leaves the
-    # key, so it repeats - but each repeat needs cooldown + dwell*repeat_factor.
+def test_dwell_repeats_in_place_after_cooldown_and_repeat_dwell() -> None:
     act = DwellActivation(dwell_time=0.5, cooldown=0.2, repeat_factor=1.25)
     fire_times = []
     for i in range(200):  # 5 s glued to the same key
@@ -39,51 +37,46 @@ def test_dwell_repeats_in_place_after_cooldown_and_repeat_dwell():
             fire_times.append(t)
     assert len(fire_times) >= 2 # in-place repeats happen (no leave needed)
 
-    # first at ~0.5 s (plain dwell), the second only after cooldown + repeat dwell
     assert fire_times[0] <= 0.6
     gap = fire_times[1] - fire_times[0]
     assert gap >= 0.2 + 0.5 * 1.25 - 0.05 # cooldown + repeat threshold
 
 
-def test_dwell_leaving_and_returning_uses_plain_threshold_again():
+def test_dwell_leaving_and_returning_uses_plain_threshold_again() -> None:
     act = DwellActivation(dwell_time=0.5, cooldown=0.2, repeat_factor=1.25)
 
-    # fire once
     for i in range(30):
-        act.update("key:a", True, 0.0, i * 0.025) # 0.75 s -> fires at 0.5 s
-    # leave the key: repeat state resets
+        act.update("key:a", True, 0.0, i * 0.025)
+
     act.update(None, False, 0.0, 1.0)
-    act.update("key:b", True, 0.0, 1.05)  # somewhere else
-    # return: the next activation is a PLAIN dwell again, not the repeat dwell
+    act.update("key:b", True, 0.0, 1.05)
+
     fired = []
-    for i in range(24): # 0.6 s, enough for plain 0.5 s but not repeat 0.625 s
+    for i in range(24):
         t = 2.0 + i * 0.025
         ev = act.update("key:a", True, 0.0, t)
         if ev:
             fired.append(t)
     assert len(fired) == 1
-    assert fired[0] <= 2.0 + 0.55 # plain threshold, not the longer repeat one
+    assert fired[0] <= 2.0 + 0.55 
 
 
-def test_dwell_repeat_progress_reaches_one():
+def test_dwell_repeat_progress_reaches_one() -> None:
     act = DwellActivation(dwell_time=0.5, cooldown=0.2, repeat_factor=1.25)
-    # first fire
     for i in range(30):
         act.update("key:a", True, 0.0, i * 0.025)
 
-    # accumulate a repeat with fine steps and record progress just before it
-    # fires (progress resets to 0 on the firing frame).
     peak = 0.0
     for i in range(400):
         t = 0.75 + i * 0.005
         ev = act.update("key:a", True, 0.0, t)
-        if ev: # a repeat fired: the arc had filled to ~1.0 the frame before
+        if ev:
             break
         peak = max(peak, act.progress)
-    assert peak >= 0.99 # the arc fills (relative to the repeat threshold) for repeats too
+    assert peak >= 0.99
 
 
-def test_dwell_target_change_resets_progress():
+def test_dwell_target_change_resets_progress() -> None:
     act = DwellActivation(dwell_time=1.0)
     for i in range(30):
         act.update("key:a", True, 0.0, i * 0.025)
@@ -92,42 +85,45 @@ def test_dwell_target_change_resets_progress():
     assert act.progress < 0.1
 
 
-def test_dwell_grace_survives_short_blink_but_not_long_break():
+def test_dwell_grace_survives_short_blink_but_not_long_break() -> None:
     act = DwellActivation(dwell_time=1.0, grace=0.25)
     for i in range(20):
-        act.update("key:a", True, 0.0, i * 0.025) # 0.5 s accumulated
+        act.update("key:a", True, 0.0, i * 0.025)
     p_before = act.progress
+
     act.update(None, False, 1.0, 0.55) # blink 0.1 s < grace
     act.update("key:a", True, 0.0, 0.60)
-    assert act.progress >= p_before * 0.9 # progress held
+    assert act.progress >= p_before * 0.9
+
     act.update(None, False, 0.0, 0.70)
     act.update(None, False, 0.0, 1.10) # 0.4 s > grace
     assert act.progress == 0.0
 
 
-# blink
-
 class _Cat:
-    def __init__(self, name, score):
-        self.category_name, self.score = name, score
+    """Mock for testing BlendshapeCategory duck-typing."""
+
+    def __init__(self, name: str, score: float) -> None:
+        self.category_name = name
+        self.score = score
 
 
-def test_extract_blink_score_averages_both_eyes():
+def test_extract_blink_score_averages_both_eyes() -> None:
     bs = [_Cat("eyeBlinkLeft", 0.8), _Cat("eyeBlinkRight", 0.6), _Cat("jawOpen", 1.0)]
-    assert abs(extract_blink_score(bs) - 0.7) < 1e-9
+    assert abs(extract_blink_score(bs) - 0.7) < 1e-9 # type: ignore
     assert extract_blink_score(None) is None
 
 
-def test_deliberate_blink_fires_natural_blink_ignored():
+def test_deliberate_blink_fires_natural_blink_ignored() -> None:
     act = BlinkActivation(min_blink=0.35, max_blink=1.2)
 
-    # natural blink: 0.15 s closed
+    # Natural blink: 0.15 s closed
     act.update("key:a", True, 0.0, 0.0)
     act.update(None, False, 0.9, 0.10)
     ev = act.update("key:a", True, 0.0, 0.25)
     assert ev is None
 
-    # deliberate blink: 0.5 s closed
+    # Deliberate blink: 0.5 s closed
     act.update("key:a", True, 0.0, 0.30)
     act.update(None, False, 0.9, 0.40)
     ev = None
@@ -135,7 +131,7 @@ def test_deliberate_blink_fires_natural_blink_ignored():
     assert ev is not None and ev.kind == ActivationKind.BLINK and ev.target_id == "key:a"
 
 
-def test_overlong_closure_is_rest_not_intent():
+def test_overlong_closure_is_rest_not_intent() -> None:
     act = BlinkActivation(min_blink=0.35, max_blink=1.2)
     act.update("key:a", True, 0.0, 0.0)
     act.update(None, False, 0.9, 0.1)
@@ -143,29 +139,29 @@ def test_overlong_closure_is_rest_not_intent():
     assert ev is None
 
 
-def test_registry_strategies_satisfy_protocol():
+def test_registry_strategies_satisfy_protocol() -> None:
     for factory in ACTIVATION_REGISTRY.values():
         assert isinstance(factory(), ActivationStrategy)
 
 
-# kind telemetry contract
-
-def test_activation_event_kind_is_enum_member():
+def test_activation_event_kind_is_enum_member() -> None:
     act = DwellActivation(dwell_time=0.1)
     ev = act.update("key:a", True, 0.0, 0.0)
-    ev = act.update("key:a", True, 0.0, 0.2) # crosses dwell_time
+    ev = act.update("key:a", True, 0.0, 0.2)
+    assert ev is not None
     assert isinstance(ev.kind, ActivationKind)
     assert ev.kind is ActivationKind.DWELL
 
     act = BlinkActivation(min_blink=0.35, max_blink=1.2)
     act.update("key:a", True, 0.0, 0.0)
     act.update(None, False, 0.9, 0.1)
-    ev = act.update("key:a", True, 0.05, 0.5) # 0.4 s closed: deliberate
+    ev = act.update("key:a", True, 0.05, 0.5)
+    assert ev is not None
     assert isinstance(ev.kind, ActivationKind)
     assert ev.kind is ActivationKind.BLINK
 
 
-def test_activation_kind_serializes_to_plain_string_not_repr():
+def test_activation_kind_serializes_to_plain_string_not_repr() -> None:
     payload = json.dumps({"kind": ActivationKind.DWELL, "target": "key:a"})
     assert json.loads(payload)["kind"] == "dwell"
-    assert "ActivationKind" not in payload # not the repr form
+    assert "ActivationKind" not in payload

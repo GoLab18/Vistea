@@ -6,7 +6,8 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from typing import Iterable, Protocol
+from collections.abc import Iterable
+from typing import Protocol
 
 import numpy as np
 
