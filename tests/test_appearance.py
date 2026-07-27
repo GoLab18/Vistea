@@ -26,7 +26,8 @@ from core.appearance import (
 
 
 def _wait_until(pred: Callable[[], bool], timeout: float = 3.0) -> bool:
-    """Poll ``pred`` until it is true or ``timeout`` elapses."""
+    """Poll `pred` until it is true or `timeout` elapses."""
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         if pred():
@@ -36,7 +37,7 @@ def _wait_until(pred: Callable[[], bool], timeout: float = 3.0) -> bool:
 
 
 class _GatedEstimator:
-    """Fake L2CSEstimator whose first ``angles`` call blocks on a gate."""
+    """Fake L2CSEstimator whose first `angles` call blocks on a gate."""
 
     def __init__(self) -> None:
         self.gate = threading.Event()

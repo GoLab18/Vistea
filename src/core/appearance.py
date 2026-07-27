@@ -5,7 +5,7 @@ This calibration feature family regresses two gaze angles (pitch and yaw) direct
 from a cropped face image using a pretrained convolutional network (L2CS-Net).
 The network runs efficiently in a seperate background daemon thread.
 
-Torch and torchvision are optional dependencies (part of the ``cnn`` dependency group).
+Torch and torchvision are optional dependencies (part of the `cnn` dependency group).
 Failures (missing libraries, missing weights) gracefully degrade to `None` with log notices.
 """
 
@@ -17,7 +17,7 @@ import math
 import threading
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
 
@@ -204,8 +204,10 @@ class L2CSEstimator:
             return None
 
 
-class L2CSConsumer(Protocol):
-    _l2cs_last_seq: int
+class L2CSConsumerMixin:
+    """Tracks the sequence number of the last consumed L2CS inference."""
+
+    _l2cs_last_seq: int = -1
 
 
 class L2CSWorker:

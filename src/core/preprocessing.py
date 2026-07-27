@@ -70,8 +70,7 @@ PREPROCESSOR_FACTORIES: Final[dict[str, Callable[[], FramePreprocessor]]] = {
     "CLAHE (adaptive)": ClahePreprocessing,
 }
 
-# Manual labels chosen by the operator before a measurement session.
-# Bound into the research log as ``lighting_condition``.
+# Manual labels chosen by the operator before a measurement session
 LIGHTING_CONDITIONS: Final[list[str]] = [
     "unknown",
     "daylight",

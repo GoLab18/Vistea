@@ -1,18 +1,65 @@
 """Tests for calibration strategies: plans, interpolation, lag compensation, hybrid."""
 
+from __future__ import annotations
+
 import math
 
 from core.calibration import (
     PURSUIT_LAG_S,
+    FeatureSource,
     HybridCalibration,
     NormalizedPoint,
     Segment,
+    SegmentKind,
     SmoothPursuitCalibration,
     STRATEGY_REGISTRY,
     make_grid,
 )
 
-def test_plans_declared():
+
+def test_registry_has_16pt_pose_variant() -> None:
+    """The dense 16-point grid is also available in a pose-augmented variant,
+    targeting the elevated edge error that the sparser 9-point grid leaves
+    under-anchored."""
+
+    assert "Ridge 16-pt + pose" in STRATEGY_REGISTRY
+    s = STRATEGY_REGISTRY["Ridge 16-pt + pose"]()
+    assert s.use_head_pose is True
+    assert len(s.target_sequence()) == 16  # 4x4 grid
+    assert s.name == "ridge_poly2_16pt_pose"
+
+
+def test_registry_has_l2cs_linear_variant() -> None:
+    """The appearance family is registered as a linear (degree-1) Ridge over
+    the L2CS gaze-angle feature source."""
+
+    key = "L2CS-Net + linear (CNN)"
+    assert key in STRATEGY_REGISTRY
+    s = STRATEGY_REGISTRY[key]()
+    assert s.feature_source == FeatureSource.L2CS
+    assert s.name == "l2cs_linear"
+
+    assert s.samples_per_point == 12
+    assert s.spread_threshold == 0.08
+
+    poly = s._model.steps[0][1]
+    assert poly.degree == 1
+
+
+def test_all_non_l2cs_strategies_use_pcec() -> None:
+    """Every geometric strategy declares the PC-EC feature source and the shared
+    static-collection budget; only the appearance strategy overrides them."""
+
+    for key, factory in STRATEGY_REGISTRY.items():
+        s = factory()
+        if key == "L2CS-Net + linear (CNN)":
+            continue
+        assert s.feature_source == FeatureSource.PCEC, key
+        assert s.samples_per_point == 25, key
+        assert s.spread_threshold == 0.006, key
+
+
+def test_plans_declared() -> None:
     """Every registered strategy exposes a well-formed Plan-as-Data plan."""
 
     for factory in STRATEGY_REGISTRY.values():
@@ -20,26 +67,23 @@ def test_plans_declared():
         plan = s.plan()
         assert len(plan) >= 1
         for seg in plan:
-            assert seg.kind in ("static", "pursuit")
+            assert seg.kind in (SegmentKind.STATIC, SegmentKind.PURSUIT)
             assert len(seg.points) >= 1
-            if seg.kind == "pursuit":
+            if seg.kind == SegmentKind.PURSUIT:
                 assert seg.duration_s > 0
 
 
-def test_pursuit_position_interpolation():
-    seg = Segment("pursuit", [NormalizedPoint(0.0, 0.0), NormalizedPoint(1.0, 1.0)], duration_s=10.0)
+def test_pursuit_position_interpolation() -> None:
+    seg = Segment(SegmentKind.PURSUIT, [NormalizedPoint(0.0, 0.0), NormalizedPoint(1.0, 1.0)], duration_s=10.0)
     mid = seg.position_at(5.0)
     assert math.isclose(mid.x, 0.5, abs_tol=1e-9) and math.isclose(mid.y, 0.5, abs_tol=1e-9)
-    assert seg.position_at(-1.0) == seg.points[0] # clamped
-    assert seg.position_at(999.0) == seg.points[-1] # clamped
+    assert seg.position_at(-1.0) == seg.points[0]
+    assert seg.position_at(999.0) == seg.points[-1]
 
 
-def test_pursuit_lag_labelling_recovers_mapping():
+def test_pursuit_lag_labelling_recovers_mapping() -> None:
     """
-    Simulates the interpreter's clock-based lag compensation: the 'eye'
-    follows the target PURSUIT_LAG_S behind. Labelling each sample with the
-    trajectory position at (t - lag) must recover the true feature->screen
-    mapping; labelling with the position at t (no compensation) must not.
+    Simulates the interpreter's clock-based lag compensation.
     """
 
     def run(compensate: bool) -> float:
@@ -48,7 +92,7 @@ def test_pursuit_lag_labelling_recovers_mapping():
         true_map = lambda p: [0.2 * p.x - 0.1, 0.15 * p.y, 0.2 * p.x, 0.15 * p.y - 0.05]
         t, dt = PURSUIT_LAG_S, 1.0 / 30.0
         while t < seg.duration_s:
-            gaze_at = seg.position_at(t - PURSUIT_LAG_S) # eye lags the dot
+            gaze_at = seg.position_at(t - PURSUIT_LAG_S)
             vec = true_map(gaze_at)
             label = seg.position_at(t - PURSUIT_LAG_S) if compensate else seg.position_at(t)
             strategy.add_samples(label, [vec])
@@ -57,7 +101,8 @@ def test_pursuit_lag_labelling_recovers_mapping():
         errs = []
         for p in make_grid(3, margin=0.2):
             pred = strategy.predict(true_map(p))
-            errs.append(math.hypot(pred.x - p.x, pred.y - p.y))
+            if pred is not None:
+                errs.append(math.hypot(pred.x - p.x, pred.y - p.y))
         return sum(errs) / len(errs)
 
     err_comp = run(True)
@@ -68,13 +113,11 @@ def test_pursuit_lag_labelling_recovers_mapping():
     )
 
 
-def test_hybrid_combines_static_and_pursuit():
-
+def test_hybrid_combines_static_and_pursuit() -> None:
     s = HybridCalibration()
     plan = s.plan()
-    assert [seg.kind for seg in plan] == ["static", "pursuit"]
+    assert [seg.kind for seg in plan] == [SegmentKind.STATIC, SegmentKind.PURSUIT]
 
-    # Feed both segments into the shared store and train.
     fake = lambda p: [0.2 * p.x, 0.15 * p.y, 0.2 * p.x, 0.15 * p.y]
     for p in plan[0].points:
         s.add_samples(p, [fake(p)] * 5)
