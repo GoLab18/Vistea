@@ -18,7 +18,7 @@ import heapq
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, Final
+from typing import Final, NamedTuple
 
 # A language code maps to one frequency list on disk
 _CORPUS_FILES: Final[dict[str, str]] = {
@@ -44,7 +44,7 @@ class CorpusData:
 
     words: list[str]
     rank: dict[str, int]
-    delete_index: dict[str, list[int]]
+    delete_index: dict[str, list[str]]
 
 
 def _deletion_variants(word: str) -> list[str]:
@@ -56,13 +56,13 @@ def _deletion_variants(word: str) -> list[str]:
     return variants
 
 
-def _build_delete_index(words: list[str]) -> dict[str, list[int]]:
-    """Map every deletion variant of each word to the list of word indices that produced it."""
+def _build_delete_index(words: list[str]) -> dict[str, list[str]]:
+    """Map every deletion variant to the list of word references that produced it."""
 
-    index: dict[str, list[int]] = {}
-    for i, word in enumerate(words):
+    index: dict[str, list[str]] = {}
+    for word in words:
         for variant in _deletion_variants(word):
-            index.setdefault(variant, []).append(i)
+            index.setdefault(variant, []).append(word)
     return index
 
 
@@ -100,13 +100,20 @@ def damerau_levenshtein_at_most_1(a: str, b: str) -> bool:
 class SuggestionEngine:
     """Prefix-completes words from frequency corpora and a custom dictionary."""
 
-    def __init__(self, dict_dir: Path, custom_path: Path):
+    def __init__(self, dict_dir: Path, custom_path: Path) -> None:
         self._dict_dir = Path(dict_dir)
         self._custom_path = Path(custom_path)
 
         self._corpora: dict[str, CorpusData] = {}
-        self._custom: list[str] = self._load_custom()
-        self._custom_delete_index: dict[str, list[int]] | None = None
+        
+        self._custom: list[str] = []
+        self._custom_sorted: list[str] = []
+        self._custom_rank: dict[str, int] = {}
+        self._custom_case_map: dict[str, str] = {}
+        self._custom_delete_index: dict[str, set[str]] = {}
+        self._custom_next_rank: int = -1
+
+        self._load_custom()
 
     def _corpus(self, lang: str) -> CorpusData:
         """Return cached corpus data for a language, building it lazily on first request."""
@@ -139,16 +146,39 @@ class SuggestionEngine:
         self._corpora[code] = loaded
         return loaded
 
-    def _load_custom(self) -> list[str]:
+    def _add_to_custom_memory(self, word: str, append_chrono: bool = False) -> None:
+        """Incrementally update custom indices without rebuilding the entire structure."""
+
+        lowered = word.lower()
+
+        if lowered in self._custom_case_map:
+            self._custom.remove(self._custom_case_map[lowered])
+        else:
+            bisect.insort(self._custom_sorted, lowered)
+            for variant in _deletion_variants(lowered):
+                self._custom_delete_index.setdefault(variant, set()).add(lowered)
+
+        self._custom_case_map[lowered] = word
+
+        if append_chrono:
+            self._custom.append(word)
+            self._custom_rank[lowered] = len(self._custom)
+        else:
+            self._custom.insert(0, word)
+            self._custom_rank[lowered] = self._custom_next_rank
+            self._custom_next_rank -= 1
+
+    def _load_custom(self) -> None:
         """Load the custom dictionary."""
 
         try:
             data = json.loads(self._custom_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                for w in data:
+                    if isinstance(w, str) and w.strip():
+                        self._add_to_custom_memory(w.strip(), append_chrono=True)
         except (OSError, ValueError):
-            return []
-        if not isinstance(data, list):
-            return []
-        return [str(w) for w in data if isinstance(w, str) and w.strip()]
+            pass
 
     def add_custom(self, text: str) -> bool:
         """Save a word or phrase to the custom dictionary, newest first, and persist it."""
@@ -157,54 +187,43 @@ class SuggestionEngine:
         if not word:
             return False
 
-        lowered = word.lower()
-        self._custom = [w for w in self._custom if w.lower() != lowered]
-        self._custom.insert(0, word)
-        self._custom_delete_index = None  # Invalidate cache
+        self._add_to_custom_memory(word, append_chrono=False)
 
         self._custom_path.parent.mkdir(parents=True, exist_ok=True)
         self._custom_path.write_text(json.dumps(self._custom, ensure_ascii=False), encoding="utf-8")
         return True
-
-    def _ensure_custom_index(self) -> dict[str, list[int]]:
-        """Return the symmetric-delete index over the custom dictionary."""
-
-        if self._custom_delete_index is None:
-            self._custom_delete_index = _build_delete_index(self._custom)
-        return self._custom_delete_index
 
     def _fuzzy_matches(self, needle: str, lang: str, seen: set[str]) -> list[str]:
         """Recover completions for `needle` that a plain prefix scan would miss."""
 
         variants = _deletion_variants(needle)
 
-        custom_index = self._ensure_custom_index()
-        custom_hits: list[str] = []
-        custom_idx_seen: set[int] = set()
+        custom_hits: list[tuple[str, int]] = []
+        custom_seen_words: set[str] = set()
 
         for variant in variants:
-            for i in custom_index.get(variant, ()):
-                if i in custom_idx_seen:
+            for low_word in self._custom_delete_index.get(variant, ()):
+                if low_word in custom_seen_words:
                     continue
-                custom_idx_seen.add(i)
-                word = self._custom[i]
-                low = word.lower()
-                if low == needle or low in seen:
+                custom_seen_words.add(low_word)
+                if low_word == needle or low_word in seen:
                     continue
-                if damerau_levenshtein_at_most_1(needle, low):
-                    custom_hits.append(word)
-                    seen.add(low)
+                if damerau_levenshtein_at_most_1(needle, low_word):
+                    custom_hits.append((low_word, self._custom_rank[low_word]))
+                    seen.add(low_word)
+
+        custom_hits.sort(key=lambda pair: pair[1])
+        final_custom = [self._custom_case_map[w] for w, _ in custom_hits]
 
         corpus = self._corpus(lang)
         corpus_hits: list[tuple[str, int]] = []
-        corpus_idx_seen: set[int] = set()
+        corpus_seen_words: set[str] = set()
 
         for variant in variants:
-            for i in corpus.delete_index.get(variant, ()):
-                if i in corpus_idx_seen:
+            for word in corpus.delete_index.get(variant, ()):
+                if word in corpus_seen_words:
                     continue
-                corpus_idx_seen.add(i)
-                word = corpus.words[i]
+                corpus_seen_words.add(word)
                 if word == needle or word in seen:
                     continue
                 if damerau_levenshtein_at_most_1(needle, word):
@@ -212,8 +231,9 @@ class SuggestionEngine:
                     seen.add(word)
 
         corpus_hits.sort(key=lambda pair: pair[1])
+        final_corpus = [w for w, _ in corpus_hits]
 
-        return custom_hits + [word for word, _ in corpus_hits]
+        return final_custom + final_corpus
 
     def suggest(self, prefix: str, lang: str, k: int = 3) -> list[Suggestion]:
         """Return up to `k` completions of `prefix` for a language."""
@@ -222,15 +242,24 @@ class SuggestionEngine:
         results: list[Suggestion] = []
         seen: set[str] = set()
 
-        # Custom entries preserve their stored order (newest first)
-        for word in self._custom:
-            low = word.lower()
-            if low.startswith(needle) and low != needle and low not in seen:
-                seen.add(low)
-                results.append(Suggestion(word, False))
+        # Custom dictionary literal prefix match
+        lo = bisect.bisect_left(self._custom_sorted, needle)
+        custom_span: list[str] = []
+
+        for low_word in self._custom_sorted[lo:]:
+            if not low_word.startswith(needle):
+                break
+            if low_word != needle and low_word not in seen:
+                custom_span.append(low_word)
+
+        if custom_span:
+            for low_word in heapq.nsmallest(k, custom_span, key=lambda w: self._custom_rank[w]):
+                results.append(Suggestion(self._custom_case_map[low_word], False))
+                seen.add(low_word)
                 if len(results) >= k:
                     return results
 
+        # Corpus literal prefix match
         corpus = self._corpus(lang)
         lo = bisect.bisect_left(corpus.words, needle)
         span: list[str] = []
@@ -247,6 +276,7 @@ class SuggestionEngine:
                 results.append(Suggestion(word, False))
                 seen.add(word)
 
+        # Fuzzy correction fallback
         remaining = k - len(results)
         if remaining > 0 and len(needle) >= _FUZZY_MIN_PREFIX:
             for word in self._fuzzy_matches(needle, lang, seen)[:remaining]:
