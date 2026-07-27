@@ -1,108 +1,114 @@
-"""Gaze interaction layer: overlay, tile boards, modes.
-
-Structure:
-- ``GazeOverlay`` - fullscreen, transparent, INPUT-TRANSPARENT window drawing
-  the gaze cursor, fixation ring, dwell progress and edge-zone hints. Input
-  transparency matters twice: the user's real applications stay clickable
-  underneath, and navigation-mode OS clicks pass through to them. It also
-  surfaces short-lived toast notifications (state changes such as head-pose
-  drift or a keyboard below the accuracy floor) since the main window is
-  minimized while gaze mode is active.
-- ``TileBoardWindow`` - base for gaze-activated tile panels. The windows
-  never take OS focus (``WindowDoesNotAcceptFocus`` +
-  ``WA_ShowWithoutActivating``), which is what makes system-wide typing
-  possible: the user's text field KEEPS focus while the gaze keyboard
-  injects keystrokes into it through the system actuator.
-- ``KeyboardWindow`` - dockable on-screen keyboard: pluggable language
-  layouts (``KEYBOARD_LAYOUTS``), a symbols page and an options page
-  (docking edge, board scale, opacity, lock), a preview strip with WPM
-  measurement, and a lock mode in which only a single UNLOCK tile responds
-  to gaze (a pause against the Midas touch problem when the user wants to
-  read instead of type).
-- ``BrowserBar`` - side strip for navigation mode: back/forward/page
-  up/down, switch to keyboard, exit.
-- ``SuggestionBar`` - prefix word-completion strip docked against the keyboard, one-dwell accept + save to the user's dictionary. # [commit-podpowiedzi]
-- Modes (State Pattern behind the ``GazeMode`` Protocol): ``KeyboardMode``
-  types into the OS-focused field (and mirrors it in the preview strip) and
-  feeds drift correction, ``NavigationMode`` dwell-clicks and enables
-  edge-zone scrolling. The real OS cursor is not dragged along with gaze
-  continuously - it is moved only on demand, right before a click and right
-  before a scroll tick is emitted, since the OS scroll wheel acts on
-  whatever is under the real cursor, the on-screen crosshair (drawn on
-  ``GazeOverlay``) is the continuous gaze indicator for the user.
-- ``GazeInteractionController`` - the per-frame pipeline: gaze -> I-DT
-  fixation -> hit-test on the active mode's board -> activation strategy ->
-  mode action (+ drift correction, + gestures), all logged as research
-  events (tile_activated, text_committed with WPM, drift_correction,
-  scroll_gesture) for the user studies. Coordinates handed to the system
-  actuator are converted from Qt's logical pixels to physical pixels
-  (``to_physical``), so on-demand cursor moves land correctly under
-  Windows display scaling.
-
-Tile geometry stays responsive to the user. The accuracy-derived floor
-(``min tile side = 2 x mean validation error``, core.drift.min_tile_side_px)
-is now ADVISORY: it is a reference point that flags (``_floor_unmet`` + a
-warning/toast) when the current tile falls below it, but it never clamps the
-size. An explicit user resize and the screen cap take precedence, so the
-scale slider always has a visible effect even after a poor calibration, the
-only inviolable lower bound is ``TILE_ABS_MIN`` (absolute pointer-target
-minimum). The tile side is still hard-capped to the screen dimensions, so a
-high user scale can never lay out a board wider or taller than the display.
-"""
+"""Gaze interaction layer: overlay, tile boards, modes."""
 
 from __future__ import annotations
 
 import logging
+import pathlib
+import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Any, Final, Literal, Protocol, assert_never
 
-from PySide6.QtCore import QObject, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QByteArray, QObject, QPoint, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPaintEvent, QPainter, QPen, QScreen
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QWidget
 
 from core import research_log as rlog
 from core.activation import ActivationStrategy, extract_blink_score
 from core.actuator import SystemActuator
 from core.calibration import CalibrationStrategy, NormalizedPoint
-from core.drift import DriftCorrector, min_tile_side_px
+from core.drift import BiasRecalibration, DriftCorrector, min_tile_side_px
 from core.fixation import IDTFixationDetector
-from core.gestures import EdgeScrollDetector
+from core.gestures import SCROLL_DOWN, SCROLL_NONE, SCROLL_UP, EdgeScrollDetector, ScrollDirection
+from core.suggestions import Suggestion, SuggestionEngine
 from core.vision import LandmarksData
+from core.workarea import WorkAreaReservation, make_reservation
 
-import pathlib
+ACCENT: Final[QColor] = QColor(41, 128, 185)
+ACCENT_ACTIVE: Final[QColor] = QColor(46, 204, 113)
+TILE_BG: Final[QColor] = QColor(30, 30, 35, 235)
+TILE_TEXT: Final[QColor] = QColor(240, 240, 240)
+LOCK_DIM: Final[QColor] = QColor(10, 10, 12, 170)
 
-from core.suggestions import SuggestionEngine
-
-ACCENT = QColor(41, 128, 185)
-ACCENT_ACTIVE = QColor(46, 204, 113)
-TILE_BG = QColor(30, 30, 35, 235)
-TILE_TEXT = QColor(240, 240, 240)
-LOCK_DIM = QColor(10, 10, 12, 170)
-
-KEY_PREFIX = "key:" # tile ids of character keys: "key:<char>"
-SCREEN_CLICK = "screen:click" # pseudo-target: dwell on bare screen (nav mode)
-SUGG_PREFIX = "sugg:" # tile ids of suggestion tiles: "sugg:<index>"
+KEY_PREFIX: Final[str] = "key:" # tile ids of character keys: "key:<char>"
+SCREEN_CLICK: Final[str] = "screen:click" # pseudo-target: dwell on bare screen (nav mode)
+SUGG_PREFIX: Final[str] = "sugg:" # tile ids of suggestion tiles: "sugg:<index>"
 
 
-def to_physical(x: int, y: int, dpr: float) -> Tuple[int, int]:
-    """Convert Qt logical-pixel coordinates to physical-pixel coordinates
-    for the system actuator. Qt reports geometry in logical pixels, but
-    pynput moves the real OS cursor in physical pixels, so under Windows
-    display scaling (devicePixelRatio > 1.0) an unconverted move lands the
-    real cursor toward the top-left of the intended target."""
+def to_physical(x: int, y: int, dpr: float) -> tuple[int, int]:
+    """Convert Qt logical-pixel coordinates to physical-pixel coordinates."""
 
     return round(x * dpr), round(y * dpr)
 
 
-class Ctl(str, Enum):
-    """Identifiers of all non-character tiles. A ``str`` subclass, so tile
-    ids remain plain strings for hit-testing, telemetry and the activation
-    layer, while the UI code compares against named members instead of
-    scattering string literals."""
+def _geo_tuple(rect: QRect) -> tuple[int, int, int, int]:
+    """Flatten a Qt QRect to a plain (x, y, w, h) tuple."""
 
-    # keyboard control row
+    return (rect.x(), rect.y(), rect.width(), rect.height())
+
+
+# Reserved strip px margin
+PIN_MARGIN: Final[int] = 10
+
+
+def reservation_strip(
+    dock: DockSide,
+    kb_geo: tuple[int, int, int, int],
+    sugg_geo: tuple[int, int, int, int] | None,
+    screen_geo: tuple[int, int, int, int],
+    dpr: float,
+) -> tuple[str, tuple[int, int, int, int]]:
+    """Compute the desktop strip to reserve for the pinned keyboard.
+
+    Given the keyboard geometry and the suggestion strip's, when visible, in
+    logical pixels, take their union, then build a band that spans the screen
+    along the docking edge.
+    """
+
+    kx, ky, kw, kh = kb_geo
+    left, top = kx, ky
+    right, bottom = kx + kw, ky + kh
+    if sugg_geo is not None:
+        sx, sy, sw, sh = sugg_geo
+        left = min(left, sx)
+        top = min(top, sy)
+        right = max(right, sx + sw)
+        bottom = max(bottom, sy + sh)
+
+    scr_x, scr_y, scr_w, scr_h = screen_geo
+
+    match dock:
+        case DockSide.TOP:
+            edge = "top"
+            thickness = (bottom - scr_y) + PIN_MARGIN
+            strip = (scr_x, scr_y, scr_w, thickness)
+        case DockSide.BOTTOM:
+            edge = "bottom"
+            thickness = (scr_y + scr_h - top) + PIN_MARGIN
+            strip = (scr_x, scr_y + scr_h - thickness, scr_w, thickness)
+        case DockSide.LEFT:
+            edge = "left"
+            thickness = (right - scr_x) + PIN_MARGIN
+            strip = (scr_x, scr_y, thickness, scr_h)
+        case DockSide.RIGHT:
+            edge = "right"
+            thickness = (scr_x + scr_w - left) + PIN_MARGIN
+            strip = (scr_x + scr_w - thickness, scr_y, thickness, scr_h)
+        case _:
+            assert_never(dock)
+
+    px, py = to_physical(strip[0], strip[1], dpr)
+    pw, ph = to_physical(strip[2], strip[3], dpr)
+    return edge, (px, py, pw, ph)
+
+
+class Ctl(str, Enum):
+    """Identifiers of all non-character tiles."""
+
+    # Keyboard control row
 
     OPTIONS = "ctl:options"
     LANG = "ctl:lang"
@@ -115,7 +121,7 @@ class Ctl(str, Enum):
     EXIT = "ctl:exit"
     ADD_WORD = "ctl:addword"
 
-    # options page
+    # Options page
 
     DOCK_TOP = "ctl:dock_top"
     DOCK_BOTTOM = "ctl:dock_bottom"
@@ -128,8 +134,10 @@ class Ctl(str, Enum):
     CLEAR = "ctl:clear"
     LOCK = "ctl:lock"
     UNLOCK = "ctl:unlock"
+    PIN = "ctl:pin"
+    RECAL = "ctl:recal"
 
-    # browser bar
+    # Browser bar
 
     BACK = "ctl:back"
     FORWARD = "ctl:fwd"
@@ -138,9 +146,7 @@ class Ctl(str, Enum):
     KEYBOARD = "ctl:kbd"
 
 
-import pathlib
-
-ICON_FILES: Dict[str, str] = {
+ICON_FILES: Final[dict[str, str]] = {
     Ctl.BACK: "arrow-left",
     Ctl.FORWARD: "arrow-right",
     Ctl.PAGE_UP: "chevrons-up",
@@ -156,24 +162,21 @@ ICON_FILES: Dict[str, str] = {
     Ctl.DOCK_RIGHT: "arrow-right-to-line",
     Ctl.LOCK: "lock",
     Ctl.UNLOCK: "lock-open",
+    Ctl.PIN: "pin",
     Ctl.OPTIONS: "settings",
     Ctl.CLEAR: "eraser",
     Ctl.SIZE_UP: "zoom-in",
     Ctl.SIZE_DOWN: "zoom-out",
+    Ctl.RECAL: "target",
 }
 
-ICONS_DIR = pathlib.Path(__file__).resolve().parent.parent / "assets" / "icons"
+ICONS_DIR: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parent.parent / "assets" / "icons"
 
-_ICON_RENDERERS: Dict[str, Optional[object]] = {}
+_ICON_RENDERERS: dict[str, QSvgRenderer | None] = {}
 
 
-def _icon_renderer(tile_id: str) -> Optional[object]:
-    """Lazily build (and cache) a QSvgRenderer for a tile's Lucide icon.
-    Must stay lazy/inside a paint path - scripts/smoke_ui.py stubs Qt (no
-    PySide6.QtSvg module at all) and never runs paintEvent, so the import
-    itself is deferred to this call. A cached None means "no icon for this
-    tile" (missing file / bad SVG / QtSvg unavailable) and short-circuits
-    the disk read and parse on every subsequent repaint."""
+def _icon_renderer(tile_id: str) -> QSvgRenderer | None:
+    """Lazily build (and cache) a QSvgRenderer for an icon."""
 
     if tile_id in _ICON_RENDERERS:
         return _ICON_RENDERERS[tile_id]
@@ -181,28 +184,28 @@ def _icon_renderer(tile_id: str) -> Optional[object]:
     name = ICON_FILES.get(tile_id)
     if name is not None:
         try:
-            from PySide6.QtCore import QByteArray
-            from PySide6.QtSvg import QSvgRenderer
             svg_path = ICONS_DIR / f"{name}.svg"
             data = svg_path.read_text(encoding="utf-8")
             data = data.replace("currentColor", "#f0f0f0")
+
             candidate = QSvgRenderer(QByteArray(data.encode("utf-8")))
             if candidate.isValid():
                 renderer = candidate
         except (OSError, ImportError):
             renderer = None
+
     _ICON_RENDERERS[tile_id] = renderer
     return renderer
 
 
 class ModeAction(Enum):
-    """Semantic outcome of a tile activation that the controller must act
-    on (everything else is handled inside the mode/board)."""
+    """Tile activation outcome that the controller must act on."""
 
     TO_KEYBOARD = "to_keyboard"
     TO_NAV = "to_nav"
     EXIT = "exit"
     CLICK = "click"
+    RECAL = "recal"
 
 
 class Page(Enum):
@@ -220,43 +223,49 @@ class DockSide(Enum):
 
 @dataclass(frozen=True)
 class KeyboardLayout:
-    """A language-specific letter arrangement. Layouts are first-class data:
-    adding a language means adding an entry to ``KEYBOARD_LAYOUTS``, nothing
-    else changes. Diacritics are ordinary first-class tiles in their own
-    row - no dead keys, no long-press, no separate diacritics page."""
+    """A language-specific letter arrangement.."""
 
-    code: str # short badge shown on the LANG tile
+    code: str # short badge for the language tile
     label: str
-    letter_rows: Tuple[str, ...]
+    letter_rows: tuple[str, ...]
 
 
-SYMBOL_ROWS: Tuple[str, ...] = (
+SYMBOL_ROWS: tuple[str, ...] = (
     "1234567890",
     "!-:;()\"'@_",
     "+*/=%&#<>",
 )
 
-KEYBOARD_LAYOUTS: Tuple[KeyboardLayout, ...] = (
+KEYBOARD_LAYOUTS: tuple[KeyboardLayout, ...] = (
     KeyboardLayout("EN", "English", ("qwertyuiop", "asdfghjkl", "zxcvbnm,.?")),
     KeyboardLayout("PL", "Polski", ("qwertyuiop", "asdfghjkl", "zxcvbnm,.?", "ąćęłńóśźż")),
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class Tile:
     tile_id: str
     label: str
-    rect: QRect # in GLOBAL screen pixels
+    rect: QRect # in global screen pixels
+
+
+type ToastLevel = Literal["info", "warning", "error"]
+
+@dataclass(frozen=True)
+class ToastMessage:
+    text: str
+    level: ToastLevel
+    expiry: float
 
 
 class TileBoardWindow(QWidget):
     """Frameless, focus-less, always-on-top panel of gaze-activated tiles."""
 
-    def __init__(self, screen):
+    def __init__(self, screen: QScreen) -> None:
         super().__init__()
         self._screen = screen
-        self.tiles: List[Tile] = []
-        self._highlight: Optional[str] = None
+        self.tiles: list[Tile] = []
+        self._highlight: str | None = None
         self._progress = 0.0
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -267,15 +276,13 @@ class TileBoardWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-    # gaze interface
-
-    def hit_test(self, gx: int, gy: int) -> Optional[str]:
+    def hit_test(self, gx: int, gy: int) -> str | None:
         for tile in self.tiles:
             if tile.rect.contains(gx, gy):
                 return tile.tile_id
         return None
 
-    def tile_center_norm(self, tile_id: str) -> Optional[NormalizedPoint]:
+    def tile_center_norm(self, tile_id: str) -> NormalizedPoint | None:
         geo = self._screen.geometry()
         for tile in self.tiles:
             if tile.tile_id == tile_id:
@@ -283,18 +290,18 @@ class TileBoardWindow(QWidget):
                 return NormalizedPoint(c.x() / geo.width(), c.y() / geo.height())
         return None
 
-    def set_highlight(self, tile_id: Optional[str], progress: float) -> None:
+    def set_highlight(self, tile_id: str | None, progress: float) -> None:
         if tile_id != self._highlight or abs(progress - self._progress) > 0.02:
             self._highlight, self._progress = tile_id, progress
             self.update()
 
-    def _paint_tile(self, painter: QPainter, tile: Tile, origin) -> None:
+    def _paint_tile(self, painter: QPainter, tile: Tile, origin: QPoint) -> None:
         local = tile.rect.translated(-origin.x(), -origin.y()).adjusted(3, 3, -3, -3)
         active = tile.tile_id == self._highlight
         painter.setPen(QPen(ACCENT_ACTIVE if active else ACCENT, 3 if active else 1))
         painter.setBrush(TILE_BG)
         painter.drawRoundedRect(local, 10, 10)
-        if active and self._progress > 0.0: # dwell progress arc on the tile
+        if active and self._progress > 0.0:
             painter.setPen(QPen(ACCENT_ACTIVE, 5))
             side = min(local.width(), local.height()) - 14
             arc_rect = QRect(0, 0, side, side)
@@ -313,7 +320,7 @@ class TileBoardWindow(QWidget):
 
         painter.drawText(local, Qt.AlignmentFlag.AlignCenter, tile.label)
 
-    def paintEvent(self, event):
+    def paintEvent(self, _event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         origin = self.mapToGlobal(self.rect().topLeft())
@@ -324,16 +331,11 @@ class TileBoardWindow(QWidget):
 
 class KeyboardWindow(TileBoardWindow):
     """Dockable on-screen keyboard with language layouts, pages, window
-    controls and a lock mode.
-
-    The preview strip mirrors what has been typed through the gaze keyboard
-    since entering the mode. The authoritative text lives in the OS-focused
-    field (the user may also edit it by other means), so the strip is a
-    feedback aid and the WPM source, not the source of truth.
-    """
+    controls and a lock mode."""
 
     committed = Signal(str) # emitted on ENTER with the preview content
     floor_unmet_changed = Signal(bool)
+    pin_toggled = Signal(bool) # emitted when the PIN tile flips the pinned state
 
     BUFFER_H = 60
     TILE_MAX = 130
@@ -343,18 +345,20 @@ class KeyboardWindow(TileBoardWindow):
     DEFAULT_WIDTH_FRAC = 0.5 # board default width when docked top/bottom (~half screen)
     SIDE_DOCK_WIDTH_FRAC = 0.45 # board width cap when docked left/right
 
-    def __init__(self, screen, min_tile_px: int):
+    def __init__(self, screen: QScreen, min_tile_px: int) -> None:
         super().__init__(screen)
+        self.reserve_suggestion_row = False
         self.min_tile_px = min_tile_px
         self.page = Page.LETTERS
         self.dock = DockSide.BOTTOM
         self.scale = 1.0
         self.opacity_level = 1.0
         self.locked = False
+        self.pinned = False
         self._layout_idx = 0
         self.buffer = ""
-        self._first_key_t: Optional[float] = None
-        self._unlock_tile: Optional[Tile] = None
+        self._first_key_t: float | None = None
+        self._unlock_tile: Tile | None = None
         self._floor_unmet = False
         self._layout_tiles()
 
@@ -362,14 +366,14 @@ class KeyboardWindow(TileBoardWindow):
     def layout(self) -> KeyboardLayout:
         return KEYBOARD_LAYOUTS[self._layout_idx]
 
-    def _rows(self) -> Optional[Tuple[str, ...]]:
+    def _rows(self) -> tuple[str, ...] | None:
         if self.page is Page.LETTERS:
             return self.layout.letter_rows
         if self.page is Page.SYMBOLS:
             return SYMBOL_ROWS
         return None # options page has no character rows
 
-    def _control_specs(self) -> List[Tuple[str, str, int]]:
+    def _control_specs(self) -> list[tuple[str, str, int]]:
         next_layout = KEYBOARD_LAYOUTS[(self._layout_idx + 1) % len(KEYBOARD_LAYOUTS)]
         page_label = "123" if self.page is Page.LETTERS else "ABC"
         return [
@@ -384,12 +388,12 @@ class KeyboardWindow(TileBoardWindow):
             (Ctl.EXIT, "EXIT", 1),
         ]
 
-    OPTION_ROWS: Tuple[Tuple[Tuple[str, str], ...], ...] = (
+    OPTION_ROWS: tuple[tuple[tuple[str, str], ...], ...] = (
         ((Ctl.DOCK_TOP, "TOP"), (Ctl.DOCK_BOTTOM, "BOTTOM"),
          (Ctl.DOCK_LEFT, "LEFT"), (Ctl.DOCK_RIGHT, "RIGHT")),
         ((Ctl.SIZE_DOWN, "SIZE -"), (Ctl.SIZE_UP, "SIZE +"),
          (Ctl.OPACITY_DOWN, "OPAC -"), (Ctl.OPACITY_UP, "OPAC +")),
-        ((Ctl.CLEAR, "CLR"), (Ctl.LOCK, "LOCK")),
+        ((Ctl.CLEAR, "CLR"), (Ctl.LOCK, "LOCK"), (Ctl.PIN, "PIN"), (Ctl.RECAL, "RECAL")),
     )
 
     def _layout_tiles(self) -> None:
@@ -404,20 +408,15 @@ class KeyboardWindow(TileBoardWindow):
             n_rows = len(self.OPTION_ROWS) + 1
             n_cols = control_units
 
-        # Tile side: fit-to-screen base, scaled by the user. The accuracy
-        # floor does NOT clamp - it only flags (below). The board defaults to
-        # ~half the screen width, the user scale then always has real effect.
         if self.dock in (DockSide.LEFT, DockSide.RIGHT):
             base = min(int(geo.width() * self.SIDE_DOCK_WIDTH_FRAC) // n_cols, self.TILE_MAX)
         else:
             base = min(int(geo.width() * self.DEFAULT_WIDTH_FRAC) // n_cols, self.TILE_MAX)
 
-        # Hard cap: the board must fit the screen no matter what the user scale
-        # demands - a tile outside the display is useless.
         cap_w = (geo.width() - 20) // n_cols
         cap_h = (geo.height() - self.BUFFER_H - 20) // n_rows
 
-        if getattr(self, "_reserve_suggestion_row", False):
+        if self.reserve_suggestion_row:
             cap_h = (geo.height() - self.BUFFER_H - 20) // (n_rows + 1)
 
         tile = max(self.TILE_ABS_MIN, min(int(base * self.scale), cap_w, cap_h))
@@ -436,18 +435,23 @@ class KeyboardWindow(TileBoardWindow):
 
         board_w = tile * n_cols
         board_h = tile * n_rows + self.BUFFER_H
-        if self.dock is DockSide.BOTTOM:
-            x0 = geo.x() + (geo.width() - board_w) // 2
-            y0 = geo.y() + geo.height() - board_h - 10
-        elif self.dock is DockSide.TOP:
-            x0 = geo.x() + (geo.width() - board_w) // 2
-            y0 = geo.y() + 10
-        elif self.dock is DockSide.LEFT:
-            x0 = geo.x() + 10
-            y0 = geo.y() + (geo.height() - board_h) // 2
-        else: # DockSide.RIGHT
-            x0 = geo.x() + geo.width() - board_w - 10
-            y0 = geo.y() + (geo.height() - board_h) // 2
+
+        match self.dock:
+            case DockSide.BOTTOM:
+                x0 = geo.x() + (geo.width() - board_w) // 2
+                y0 = geo.y() + geo.height() - board_h - 10
+            case DockSide.TOP:
+                x0 = geo.x() + (geo.width() - board_w) // 2
+                y0 = geo.y() + 10
+            case DockSide.LEFT:
+                x0 = geo.x() + 10
+                y0 = geo.y() + (geo.height() - board_h) // 2
+            case DockSide.RIGHT:
+                x0 = geo.x() + geo.width() - board_w - 10
+                y0 = geo.y() + (geo.height() - board_h) // 2
+            case _:
+                assert_never(self.dock)
+
         x0 = max(geo.x(), x0)
         y0 = max(geo.y(), y0)
         self.setGeometry(x0, y0, board_w, board_h)
@@ -482,23 +486,19 @@ class KeyboardWindow(TileBoardWindow):
             x += tile * units
         self.update()
 
-    # gaze interface
-
-    def hit_test(self, gx: int, gy: int) -> Optional[str]:
+    def hit_test(self, gx: int, gy: int) -> str | None:
         if self.locked:
             if self._unlock_tile is not None and self._unlock_tile.rect.contains(gx, gy):
                 return Ctl.UNLOCK
             return None
         return super().hit_test(gx, gy)
 
-    def tile_center_norm(self, tile_id: str) -> Optional[NormalizedPoint]:
+    def tile_center_norm(self, tile_id: str) -> NormalizedPoint | None:
         if tile_id == Ctl.UNLOCK and self._unlock_tile is not None:
             geo = self._screen.geometry()
             c = self._unlock_tile.rect.center()
             return NormalizedPoint(c.x() / geo.width(), c.y() / geo.height())
         return super().tile_center_norm(tile_id)
-
-    # preview strip ops
 
     def type_preview(self, text: str) -> None:
         if self._first_key_t is None:
@@ -521,7 +521,7 @@ class KeyboardWindow(TileBoardWindow):
         self._first_key_t = None
         self.update()
 
-    def commit_preview(self) -> Tuple[str, float, float]:
+    def commit_preview(self) -> tuple[str, float, float]:
         """Close a typing burst: returns (text, WPM, elapsed seconds) and
         resets the strip."""
 
@@ -531,8 +531,6 @@ class KeyboardWindow(TileBoardWindow):
         self.buffer, self._first_key_t = "", None
         self.update()
         return text, wpm, elapsed
-
-    # window ops
 
     def switch_page(self, page: Page) -> None:
         self.page = page
@@ -569,15 +567,19 @@ class KeyboardWindow(TileBoardWindow):
         self.locked = locked
         self.update()
 
-    # painting
+    def set_pinned(self, pinned: bool) -> None:
+        """Flip the pinned flag and announce it."""
 
-    def paintEvent(self, event):
+        if pinned == self.pinned:
+            return
+        self.pinned = pinned
+        self.pin_toggled.emit(pinned)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Buffer panel: a rounded, slightly-lighter-than-tile card with an
-        # accent outline, so the preview reads as a distinct surface.
         panel = QRect(10, 8, self.width() - 20, self.BUFFER_H - 16)
         painter.setPen(QPen(ACCENT, 1))
         painter.setBrush(QColor(48, 48, 56, 240))
@@ -605,14 +607,14 @@ class KeyboardWindow(TileBoardWindow):
 
 
 class BrowserBar(TileBoardWindow):
-    """Right-docked vertical strip for navigation mode: browser controls."""
+    """Right-docked vertical strip for navigation mode."""
 
-    SPECS: Tuple[Tuple[str, str], ...] = (
+    SPECS: tuple[tuple[str, str], ...] = (
         (Ctl.BACK, "BACK"), (Ctl.FORWARD, "FWD"), (Ctl.PAGE_UP, "PG UP"),
         (Ctl.PAGE_DOWN, "PG DN"), (Ctl.KEYBOARD, "KEYB"), (Ctl.EXIT, "EXIT"),
     )
 
-    def __init__(self, screen, min_tile_px: int):
+    def __init__(self, screen: QScreen, min_tile_px: int) -> None:
         super().__init__(screen)
         geo = screen.geometry()
         tile = min(max(min_tile_px, 90), (geo.height() - 20) // len(self.SPECS))
@@ -623,25 +625,16 @@ class BrowserBar(TileBoardWindow):
 
 
 class SuggestionBar(TileBoardWindow):
-    """Strip of prefix word-completion tiles docked against the keyboard.
-
-    Three suggestion tiles carry the current top completions and a fourth,
-    fixed ``ADD_WORD`` tile saves the typed word (or phrase) to the user's
-    dictionary. The bar mirrors the keyboard's tile size so a suggestion is
-    just as reachable by dwell as a key, and it re-docks with the keyboard
-    (above it when bottom-docked, below when top-docked, along the inner edge
-    when side-docked). It only appears on the letters page, where completing a
-    word makes sense.
-    """
+    """Strip with prefix word-completion tiles docked against the keyboard."""
 
     N_SUGGESTIONS = 3
 
-    def __init__(self, screen):
+    def __init__(self, screen: QScreen) -> None:
         super().__init__(screen)
-        self._words: List[str] = []
+        self._words: list[Suggestion] = []
         self._rect = QRect(0, 0, 0, 0)
 
-    def _keyboard_tile_px(self, keyboard: "KeyboardWindow") -> int:
+    def _keyboard_tile_px(self, keyboard: KeyboardWindow) -> int:
         for tile in keyboard.tiles:
             if tile.tile_id == Ctl.SPACE:
                 return tile.rect.height()
@@ -649,7 +642,7 @@ class SuggestionBar(TileBoardWindow):
             return keyboard.tiles[0].rect.height()
         return keyboard.min_tile_px
 
-    def reposition(self, keyboard: "KeyboardWindow") -> None:
+    def reposition(self, keyboard: KeyboardWindow) -> None:
         """Anchor the bar against the keyboard's outer geometry and rebuild
         the tile row at the keyboard's tile size."""
 
@@ -674,8 +667,7 @@ class SuggestionBar(TileBoardWindow):
             y0 = board.y()
             cell = tile
 
-        # Clamp to the screen so the strip is never cut off at an edge (e.g.
-        # a 4-row PL layout docked top leaves no room above the board).
+        # Clamp to the screen so the strip is never cut off at an edge.
         geo = self._screen.geometry()
         bar_w = cell * n
         x0 = max(geo.x(), min(x0, geo.x() + geo.width() - bar_w))
@@ -688,40 +680,39 @@ class SuggestionBar(TileBoardWindow):
         self.tiles = []
         x = x0
         for i in range(self.N_SUGGESTIONS):
-            word = self._words[i] if i < len(self._words) else ""
-            if word: # empty suggestion -> no tile, so it cannot be hit-tested
+            word = self._words[i].word if i < len(self._words) else ""
+            if word:
                 self.tiles.append(Tile(f"{SUGG_PREFIX}{i}", word, QRect(x, y0, cell, tile)))
             x += cell
         self.tiles.append(Tile(Ctl.ADD_WORD, "DICT+", QRect(x, y0, cell, tile)))
         self.update()
 
-    def _paint_tile(self, painter: QPainter, tile: Tile, origin) -> None:
-        """Give suggestion tiles a lightly accented fill so the strip reads as
-        distinct from the keyboard, the fixed DICT+ tile keeps the standard
-        look. Highlight/progress rendering is inherited from the base tile."""
-
+    def _paint_tile(self, painter: QPainter, tile: Tile, origin: QPoint) -> None:
         if tile.tile_id == Ctl.ADD_WORD:
             super()._paint_tile(painter, tile, origin)
             return
+
         local = tile.rect.translated(-origin.x(), -origin.y()).adjusted(3, 3, -3, -3)
         active = tile.tile_id == self._highlight
         painter.setPen(QPen(ACCENT_ACTIVE if active else ACCENT, 3 if active else 1))
         painter.setBrush(QColor(36, 52, 66, 235))
         painter.drawRoundedRect(local, 10, 10)
+
         if active and self._progress > 0.0:
             painter.setPen(QPen(ACCENT_ACTIVE, 5))
             side = min(local.width(), local.height()) - 14
             arc_rect = QRect(0, 0, side, side)
             arc_rect.moveCenter(local.center())
             painter.drawArc(arc_rect, 90 * 16, -int(360 * 16 * self._progress))
+
         painter.setPen(TILE_TEXT)
         painter.drawText(local, Qt.AlignmentFlag.AlignCenter, tile.label)
 
-    def suggestion_word(self, index: int) -> Optional[str]:
+    def suggestion_at(self, index: int) -> Suggestion | None:
         return self._words[index] if 0 <= index < len(self._words) else None
 
-    def set_suggestions(self, words: List[str]) -> None:
-        self._words = list(words)
+    def set_suggestions(self, suggestions: list[Suggestion]) -> None:
+        self._words = suggestions
         r = self._rect
         n = self.N_SUGGESTIONS + 1
         cell = r.width() // n if r.width() else 0
@@ -731,7 +722,7 @@ class SuggestionBar(TileBoardWindow):
 class GazeOverlay(QWidget):
     """Transparent, click-through fullscreen layer: cursor + feedback."""
 
-    def __init__(self, screen):
+    def __init__(self, screen: QScreen) -> None:
         super().__init__()
         self._screen = screen
         self.setWindowFlags(
@@ -743,36 +734,42 @@ class GazeOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setGeometry(screen.geometry())
-        self.cursor_px: Optional[tuple] = None
+        self.cursor_px: tuple[int, int] | None = None
         self.fixating = False
         self.progress = 0.0
         self.mode_name = ""
         self.scroll_zones = False
-        self.scroll_active = 0 # +1 top / -1 bottom / 0
+
+        self.scroll_active: ScrollDirection = SCROLL_NONE
         self.scroll_zone_frac = 0.12
 
-        self._toasts: List[Tuple[str, str, float]] = [] # (text, level, expiry monotonic)
+        # When set (0.0 - 1.0), a single bias-recalibration target is drawn at the
+        # screen center with a progress ring reflecting collected fixation
+        # frames. None hides it (normal interaction).
+        self.recal_target_progress: float | None = None
 
-    def notify(self, text: str, level: str = "info", ttl: float = 3.5) -> None:
+        self._toasts: list[ToastMessage] = []
+
+    def notify(self, text: str, level: ToastLevel = "info", ttl: float = 3.5) -> None:
         """Queue a short-lived toast for the overlay, keeps only the 3 most
         recent so a burst of state changes cannot pile up on screen."""
 
-        self._toasts.append((text, level, time.monotonic() + ttl))
+        self._toasts.append(ToastMessage(text, level, time.monotonic() + ttl))
         self._toasts = self._toasts[-3:]
         self.update()
 
     def _prune_toasts(self) -> None:
         now = time.monotonic()
-        self._toasts = [t for t in self._toasts if t[2] > now]
+        self._toasts = [t for t in self._toasts if t.expiry > now]
 
-    def paintEvent(self, event):
+    def paintEvent(self, _event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        if self.scroll_zones: # edge-zone hints
+        if self.scroll_zones:
             band = int(self.scroll_zone_frac * h)
-            for sign, y in ((+1, 0), (-1, h - band)):
+            for sign, y in ((SCROLL_UP, 0), (SCROLL_DOWN, h - band)):
                 col = QColor(ACCENT_ACTIVE if self.scroll_active == sign else ACCENT)
                 col.setAlpha(70 if self.scroll_active == sign else 28)
                 painter.fillRect(0, y, w, band, col)
@@ -791,9 +788,9 @@ class GazeOverlay(QWidget):
             "warning": QColor(230, 150, 40),
             "error": QColor(200, 60, 50),
         }
-        for text, level, _expiry in self._toasts:
-            border = border_by_level.get(level, ACCENT)
-            text_w = metrics.horizontalAdvance(text)
+        for toast in self._toasts:
+            border = border_by_level.get(toast.level, ACCENT)
+            text_w = metrics.horizontalAdvance(toast.text)
             box_w = text_w + 32
             box_h = metrics.height() + 16
             box_x = (w - box_w) // 2
@@ -802,15 +799,30 @@ class GazeOverlay(QWidget):
             painter.setBrush(TILE_BG)
             painter.drawRoundedRect(box_rect, 8, 8)
             painter.setPen(TILE_TEXT)
-            painter.drawText(box_rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.drawText(box_rect, Qt.AlignmentFlag.AlignCenter, toast.text)
             toast_y += box_h + 8
+
+        if self.recal_target_progress is not None:
+            cx, cy = w // 2, h // 2
+            painter.setPen(QPen(ACCENT, 2))
+            painter.drawEllipse(cx - 22, cy - 22, 44, 44)
+            painter.setBrush(ACCENT_ACTIVE)
+            painter.setPen(QPen(ACCENT_ACTIVE, 1))
+            painter.drawEllipse(cx - 6, cy - 6, 12, 12)
+            prog = max(0.0, min(1.0, self.recal_target_progress))
+            if prog > 0.0:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(ACCENT_ACTIVE, 4))
+                painter.drawArc(cx - 30, cy - 30, 60, 60, 90 * 16, -int(360 * 16 * prog))
 
         if self.cursor_px is None:
             return
         x, y = self.cursor_px
+
         color = ACCENT_ACTIVE if self.fixating else QColor(231, 76, 60)
         painter.setPen(QPen(color, 3))
         painter.drawEllipse(x - 10, y - 10, 20, 20)
+
         if self.fixating and self.progress > 0.0:
             painter.setPen(QPen(ACCENT_ACTIVE, 4))
             painter.drawArc(x - 18, y - 18, 36, 36, 90 * 16, -int(360 * 16 * self.progress))
@@ -820,32 +832,38 @@ class GazeMode(Protocol):
     name: str
     board: TileBoardWindow
     edge_scroll: bool
+    suggestions_board: TileBoardWindow | None
 
     def enter(self) -> None: ...
     def exit(self) -> None: ...
-    def on_activation(self, tile_id: str) -> Optional[ModeAction]:
-        """Handle an activated tile. May return a ModeAction for the
-        controller (mode switch / exit / OS click)."""
+    def on_activation(self, tile_id: str) -> ModeAction | None:
+        """Handles an activated tile."""
         ...
 
 
 class KeyboardMode:
+    """Handles typing into the OS-focused field."""
+
     name = "KEYBOARD"
     edge_scroll = False
 
-    def __init__(self, keyboard: KeyboardWindow, drift: Optional[DriftCorrector],
-                 actuator: SystemActuator):
+    def __init__(self, keyboard: KeyboardWindow, drift: DriftCorrector | None, 
+                 actuator: SystemActuator, on_relayout: Callable[[], None] | None = None) -> None:
         self.board = keyboard
         self._drift = drift
         self._actuator = actuator
+        self._on_relayout = on_relayout
         root = pathlib.Path(__file__).resolve().parent.parent
+
+        user_home = pathlib.Path.home()
         self.engine = SuggestionEngine(root / "assets" / "dict",
-                                       root / "logs" / "user_dictionary.json")
-        self.suggestions_board = SuggestionBar(keyboard._screen)
+                                       user_home / ".vistea" / "user_dictionary.json")
+        self.suggestions_board: SuggestionBar | None = SuggestionBar(keyboard._screen)
 
         # Reserve a tile row so the suggestion strip always fits above/below
         # the board without pushing the keyboard off-screen.
-        keyboard._reserve_suggestion_row = True
+        keyboard.reserve_suggestion_row = True
+
         keyboard._layout_tiles()
 
     def enter(self) -> None:
@@ -854,11 +872,11 @@ class KeyboardMode:
 
     def exit(self) -> None:
         self.board.hide()
-        self.suggestions_board.hide()
+        if self.suggestions_board is not None:
+            self.suggestions_board.hide()
 
     def _current_prefix(self) -> str:
-        """The word currently being typed: the buffer tail after the last
-        space (empty right after a space or on an empty buffer)."""
+        """Currently typed word: the buffer tail after the last space."""
 
         buffer = self.board.buffer
         cut = buffer.rfind(" ")
@@ -869,47 +887,65 @@ class KeyboardMode:
         hide it with the letters page."""
 
         bar = self.suggestions_board
+        if bar is None:
+            return
+
         if self.board.page is not Page.LETTERS:
             bar.hide()
             return
+
         bar.reposition(self.board)
-        words = self.engine.suggest(self._current_prefix(), self.board.layout.code)
-        bar.set_suggestions(words)
+        suggestions = self.engine.suggest(self._current_prefix(), self.board.layout.code)
+        bar.set_suggestions(suggestions)
         bar.show()
 
     def _apply_drift(self, tile_id: str) -> None:
-        # Drift correction BEFORE mutating layout: the dwell frames in the
-        # buffer are ground-truth labeled by this tile's centre.
+        # Drift correction before mutating layout: the dwell frames in the
+        # buffer are ground-truth labeled by this tile's center.
         if self._drift is None:
             return
         center = self.board.tile_center_norm(tile_id)
         if center is not None:
-            added = self._drift.on_activation(center)
-            if added:
-                rlog.event("drift_correction", tile=tile_id, n_samples=added, total=self._drift.corrections_applied)
+            result = self._drift.on_activation(center)
+            if result is not None:
+                added, pre_error_norm, post_error_norm = result
+                rlog.event(
+                    "drift_correction",
+                    tile=tile_id,
+                    n_samples=added,
+                    total=self._drift.corrections_applied,
+                    pre_error_norm=round(pre_error_norm, 5),
+                    post_error_norm=round(post_error_norm, 5),
+                )
 
-    def on_activation(self, tile_id: str) -> Optional[ModeAction]:
+    def on_activation(self, tile_id: str) -> ModeAction | None:
         board = self.board
 
-        if tile_id.startswith(SUGG_PREFIX):
+        if tile_id.startswith(SUGG_PREFIX) and self.suggestions_board is not None:
             index = int(tile_id[len(SUGG_PREFIX):])
-            word = self.suggestions_board.suggestion_word(index)
-            if word is not None:
+
+            suggestion = self.suggestions_board.suggestion_at(index)
+            if suggestion is not None:
+                word = suggestion.word
                 prefix = self._current_prefix()
                 for _ in range(len(prefix)):
                     self._actuator.press_key("backspace")
                     board.backspace_preview()
                 self._actuator.type_text(word + " ")
                 board.type_preview(word + " ")
+
                 rlog.event(
                     "suggestion_accepted",
                     word=word,
                     prefix_len=len(prefix),
                     saved_keystrokes=len(word) - len(prefix),
+                    fuzzy=suggestion.fuzzy,
                     level=logging.DEBUG
                 )
+
                 self._refresh_suggestions()
             return None
+
         if tile_id == Ctl.ADD_WORD:
             buffer = board.buffer.strip()
             text = buffer if " " in buffer else self._current_prefix()
@@ -941,9 +977,10 @@ class KeyboardMode:
             self._refresh_suggestions()
         elif tile_id == Ctl.DELETE_WORD:
             board.delete_word_preview()
-            # Ctrl+Backspace deletes the previous word in most toolkits
-            # (macOS uses Alt+Backspace - see the platform notes in README).
-            self._actuator.hotkey("ctrl", "backspace")
+            if sys.platform == "darwin":
+                self._actuator.hotkey("alt", "backspace")
+            else:
+                self._actuator.hotkey("ctrl", "backspace")
             self._refresh_suggestions()
         elif tile_id == Ctl.ENTER:
             text, wpm, elapsed = board.commit_preview()
@@ -988,6 +1025,11 @@ class KeyboardMode:
         elif tile_id == Ctl.LOCK:
             board.set_locked(True)
             rlog.event("keyboard_locked", locked=True)
+        elif tile_id == Ctl.PIN:
+            board.set_pinned(not board.pinned)
+            rlog.event("keyboard_pinned", pinned=board.pinned)
+        elif tile_id == Ctl.RECAL:
+            return ModeAction.RECAL
         elif tile_id == Ctl.NAV:
             return ModeAction.TO_NAV
         elif tile_id == Ctl.EXIT:
@@ -995,17 +1037,28 @@ class KeyboardMode:
 
         if tile_id in (Ctl.DOCK_TOP, Ctl.DOCK_BOTTOM, Ctl.DOCK_LEFT, Ctl.DOCK_RIGHT):
             rlog.event("keyboard_dock_changed", dock=board.dock.value)
+
+        # A dock or size change moves/resizes the board, so a pinned strip
+        # must be re-reserved to match (handled by the controller).
+        if self._on_relayout is not None and tile_id in (
+            Ctl.DOCK_TOP, Ctl.DOCK_BOTTOM, Ctl.DOCK_LEFT, Ctl.DOCK_RIGHT,
+            Ctl.SIZE_DOWN, Ctl.SIZE_UP,
+        ):
+            self._on_relayout()
         return None
 
 
 class NavigationMode:
+    """Handles dwell-clicks and edge-zone scrolling."""
+
     name = "NAVIGATION"
     edge_scroll = True
 
-    def __init__(self, bar: BrowserBar, actuator: SystemActuator, dpr: float = 1.0):
+    def __init__(self, bar: BrowserBar, actuator: SystemActuator, dpr: float = 1.0) -> None:
         self.board = bar
         self._actuator = actuator
         self._dpr = dpr
+        self.suggestions_board: TileBoardWindow | None = None
 
     def enter(self) -> None:
         self.board.show()
@@ -1016,13 +1069,13 @@ class NavigationMode:
     def _scroll_at_content(self, ticks: int) -> None:
         # The OS wheel acts on the window under the real cursor, which after
         # an on-demand move may sit anywhere (including over this bar), so
-        # park it at the screen centre before scrolling.
+        # park it at the screen center before scrolling.
         geo = self.board._screen.geometry()
         cx, cy = geo.x() + geo.width() // 2, geo.y() + geo.height() // 2
         self._actuator.move(*to_physical(cx, cy, self._dpr))
         self._actuator.scroll(ticks)
 
-    def on_activation(self, tile_id: str) -> Optional[ModeAction]:
+    def on_activation(self, tile_id: str) -> ModeAction | None:
         if tile_id == SCREEN_CLICK:
             return ModeAction.CLICK
         if tile_id == Ctl.BACK:
@@ -1041,23 +1094,22 @@ class NavigationMode:
 
 
 class GazeInteractionController(QObject):
-    """Per-frame interaction pipeline, owned by the main window after
-    calibration. Feed it via ``on_gaze`` from the UI update slot."""
+    """Per-frame interaction pipeline, owned by the main window after calibration."""
 
     stopped = Signal()
 
     def __init__(
         self,
         strategy: CalibrationStrategy,
-        screen,
+        screen: QScreen,
         activation: ActivationStrategy,
         actuator: SystemActuator,
-        mean_error_px: Optional[float],
-    ):
+        mean_error_px: float | None,
+    ) -> None:
         super().__init__()
         self._screen = screen
         self._geo = screen.geometry()
-        self._dpr = float(getattr(screen, "devicePixelRatio", lambda: 1.0)())
+        self._dpr = screen.devicePixelRatio()
         tile_px = min_tile_side_px(mean_error_px)
 
         self.overlay = GazeOverlay(screen)
@@ -1070,8 +1122,8 @@ class GazeInteractionController(QObject):
         self.actuator = actuator
         self.bar = BrowserBar(screen, tile_px)
 
-        self._modes: Dict[ModeAction, GazeMode] = {
-            ModeAction.TO_KEYBOARD: KeyboardMode(self.keyboard, self.drift, actuator),
+        self._modes: dict[ModeAction, GazeMode] = {
+            ModeAction.TO_KEYBOARD: KeyboardMode(self.keyboard, self.drift, actuator, self.relayout_pin),
             ModeAction.TO_NAV: NavigationMode(self.bar, actuator, self._dpr),
         }
         self.mode: GazeMode = self._modes[ModeAction.TO_KEYBOARD]
@@ -1088,70 +1140,221 @@ class GazeInteractionController(QObject):
         self.overlay.show()
         self.mode.enter()
 
+        self.workarea: WorkAreaReservation | None = None
+        self.keyboard.pin_toggled.connect(self._on_pin_toggled)
+
+        self._recal: BiasRecalibration | None = None
+        self._recal_deadline: float | None = None
+        self._gaze_bias: NormalizedPoint | None = None
+
+        # Head-pose-drift suggestion: nudge the user toward RECAL once per
+        # session after repeated drift transitions.
+        self._pose_drift_count = 0
+        self._pose_drift_hinted = False
+
         self.keyboard.floor_unmet_changed.connect(self._on_floor_unmet_changed)
         if self.keyboard._floor_unmet:
             # The window's own __init__ already laid out tiles (and would
             # have emitted the signal) before this connect existed.
             self._on_floor_unmet_changed(True)
 
-    def notify(self, text: str, level: str = "info") -> None:
+    def notify(self, text: str, level: ToastLevel = "info") -> None:
         self.overlay.notify(text, level)
 
     def _on_floor_unmet_changed(self, floor_unmet: bool) -> None:
         if floor_unmet:
             self.notify("Keyboard below accuracy floor - consider recalibrating", "warning")
 
-    # lifecycle
+    RECAL_TIMEOUT_S: Final[float] = 4.0
+
+    def _enter_recal(self) -> None:
+        """Begin single-point recalibration: draw a central target and suspend
+        normal activation while gaze predictions are gathered for the offset."""
+
+        self._recal = BiasRecalibration()
+        self._recal_deadline = time.monotonic() + self.RECAL_TIMEOUT_S
+        self.overlay.recal_target_progress = 0.0
+        self.activation.reset()
+        self.fixation.reset()
+        self.overlay.update()
+
+    def _finish_recal(self, applied: bool) -> None:
+        self._recal = None
+        self._recal_deadline = None
+        self.overlay.recal_target_progress = None
+        self.activation.reset()
+        self.fixation.reset()
+        self.overlay.update()
+
+        if applied:
+            self.notify("Recalibrated", "info")
+        else:
+            self.notify("Recalibration cancelled", "warning")
+
+    def note_pose_drift(self) -> None:
+        """Record a head-pose drift transition. On the third one this session,
+        suggest RECAL once."""
+
+        self._pose_drift_count += 1
+        if self._pose_drift_count >= 3 and not self._pose_drift_hinted:
+            self._pose_drift_hinted = True
+            self.notify("Head pose drifts often - consider RECAL (options page)", "warning")
+
+    def _ensure_workarea(self) -> WorkAreaReservation:
+        """Build the reservation backend on first use. Deferred so winId()
+        (which forces a native window) is only called once the user pins."""
+
+        if self.workarea is None:
+            hwnd = int(self.keyboard.winId()) if sys.platform == "win32" else None
+            self.workarea = make_reservation(hwnd)
+        return self.workarea
+
+    def _reserve_current_strip(self) -> None:
+        """(Re)reserve the desktop strip for the current keyboard geometry,
+        taking the suggestion strip into account when it's visible."""
+
+        workarea = self._ensure_workarea()
+        kb = self.keyboard
+        kb_geo = _geo_tuple(kb.geometry())
+        sugg = self.mode.suggestions_board
+        sugg_geo = _geo_tuple(sugg.geometry()) if sugg is not None and sugg.isVisible() else None
+        edge, rect = reservation_strip(kb.dock, kb_geo, sugg_geo, _geo_tuple(self._geo), self._dpr)
+        workarea.reserve(edge, rect)
+
+    def _on_pin_toggled(self, pinned: bool) -> None:
+        if pinned:
+            self._reserve_current_strip()
+            self.notify("Keyboard pinned - windows make room")
+        else:
+            if self.workarea is not None:
+                self.workarea.release()
+            self.notify("Keyboard unpinned")
+
+    def relayout_pin(self) -> None:
+        """Called after a dock or size change: re-reserves the strip if the
+        keyboard is currently pinned."""
+
+        if self.keyboard.pinned:
+            self._reserve_current_strip()
 
     def stop(self) -> None:
-        self.mode.exit()
-        self.overlay.hide()
-        rlog.event("gaze_mode_stopped")
-        self.stopped.emit()
+        try:
+            if self.workarea is not None:
+                self.workarea.release()
+        finally:
+            self.mode.exit()
+            self.overlay.hide()
+            rlog.event("gaze_mode_stopped")
+            self.stopped.emit()
 
     def _switch(self, action: ModeAction) -> None:
         self.mode.exit()
         self.activation.reset()
         self.fixation.reset()
+
+        # Pinning does not apply to navigation mode
+        if action is ModeAction.TO_NAV and self.workarea is not None:
+            self.workarea.release()
+
         self.mode = self._modes[action]
         self.mode.enter()
         self.overlay.mode_name = self.mode.name
+
+        if action is ModeAction.TO_KEYBOARD and self.keyboard.pinned:
+            self._reserve_current_strip()
+
         rlog.event("mode_switched", mode=self.mode.name)
 
-    # per-frame pipeline
+    def _apply_bias(self, gaze: NormalizedPoint | None) -> NormalizedPoint | None:
+        """Adds the stored bias offset to a gaze point shifting everything with it."""
 
-    def on_gaze(self, gaze: Optional[NormalizedPoint], data: LandmarksData,
-                vec: Optional[list]) -> None:
+        if gaze is None or self._gaze_bias is None:
+            return gaze
+        return NormalizedPoint(
+            min(1.0, max(0.0, gaze.x + self._gaze_bias.x)),
+            min(1.0, max(0.0, gaze.y + self._gaze_bias.y)),
+        )
+
+    def _run_recalibration(self, gaze: NormalizedPoint | None, t: float) -> None:
+        """Collect fixation-frame predictions against the central target while
+        recalibration is active."""
+
+        recal = self._recal
+        if recal is None:
+            return
+        target = NormalizedPoint(0.5, 0.5)
+
+        gx = gy = None
+        if gaze is not None:
+            gx, gy = gaze.x, gaze.y
+        fix = self.fixation.update(gx, gy, t)
+        if fix.fixating and gaze is not None:
+            recal.feed(gaze)
+
+        self.overlay.recal_target_progress = min(1.0, recal.n_fed / recal.MIN_FRAMES)
+        self.overlay.cursor_px = (
+            self._geo.x() + int(gx * self._geo.width()),
+            self._geo.y() + int(gy * self._geo.height()),
+        ) if gx is not None else None
+        self.overlay.fixating = fix.fixating
+        self.overlay.progress = 0.0
+        self.overlay.update()
+
+        timed_out = self._recal_deadline is not None and t >= self._recal_deadline
+        offset = recal.compute(target)
+        if offset is not None:
+            prev = self._gaze_bias or NormalizedPoint(0.0, 0.0)
+            self._gaze_bias = NormalizedPoint(prev.x + offset[0], prev.y + offset[1])
+            rlog.event(
+                "drift_recalibration",
+                offset_x=round(self._gaze_bias.x, 5),
+                offset_y=round(self._gaze_bias.y, 5),
+                n_frames=recal.n_fed,
+            )
+            self._finish_recal(applied=True)
+        elif timed_out:
+            self._finish_recal(applied=False)
+
+    def on_gaze(self, gaze: NormalizedPoint | None, data: LandmarksData,
+                vec: list[float] | None) -> None:
         t = time.monotonic()
+
+        gaze = self._apply_bias(gaze)
+
+        # While recalibrating, normal activation is suspended
+        if self._recal is not None:
+            self._run_recalibration(gaze, t)
+            return
+
         gx = gy = None
         if gaze is not None:
             gx, gy = gaze.x, gaze.y
         fix = self.fixation.update(gx, gy, t)
 
-        # Hit-test at the fixation centroid when available (stable), else gaze.
-        target: Optional[str] = None
+        # Hit-test at the fixation centroid when available (stable), else gaze
+        target: str | None = None
         px = py = None
         probe = fix.centroid if fix.fixating else (gx, gy) if gx is not None else None
+
         if probe is not None:
             px = self._geo.x() + int(probe[0] * self._geo.width())
             py = self._geo.y() + int(probe[1] * self._geo.height())
             target = self.mode.board.hit_test(px, py)
 
             if target is None:
-                extra = getattr(self.mode, "suggestions_board", None)
+                extra = self.mode.suggestions_board
                 if extra is not None and extra.isVisible():
                     target = extra.hit_test(px, py)
 
             if target is None and self.mode.edge_scroll and self.edge.current_zone == 0:
-                # Navigation mode: dwelling on plain screen is itself a target
-                # (an OS click) - without a pseudo-target the dwell timer
-                # would never arm off-board.
+                # Navigation mode: dwelling on plain screen.
                 target = SCREEN_CLICK
 
         if fix.fixating and target is not None and target.startswith((KEY_PREFIX, "ctl:")):
             self.drift.observe(vec)
 
         blink = extract_blink_score(data.blendshapes)
+
         event = self.activation.update(target, fix.fixating, blink, t)
         if event is not None:
             rlog.event(
@@ -1166,14 +1369,17 @@ class GazeInteractionController(QObject):
                 return
             if action in (ModeAction.TO_NAV, ModeAction.TO_KEYBOARD):
                 self._switch(action)
-            elif action is ModeAction.CLICK and px is not None:
+            elif action is ModeAction.RECAL:
+                self._enter_recal()
+                return
+            elif action is ModeAction.CLICK and px is not None and py is not None:
                 self.actuator.move(*to_physical(px, py, self._dpr))
                 self.actuator.click()
 
         if self.mode.edge_scroll:
             was_active = self.edge.active
             ticks = self.edge.update(gy, t)
-            if ticks and gx is not None:
+            if ticks and gx is not None and gy is not None:
                 # The OS scroll wheel acts on whatever is under the real
                 # cursor, so move it under the current gaze point first.
                 sx = self._geo.x() + int(gx * self._geo.width())
@@ -1183,16 +1389,17 @@ class GazeInteractionController(QObject):
             if self.edge.active and not was_active:
                 rlog.event(
                     "scroll_gesture",
-                    direction="up" if self.edge.current_zone > 0 else "down",
+                    direction="up" if self.edge.current_zone == SCROLL_UP else "down",
                     level=logging.DEBUG
                 )
             self.overlay.scroll_zones = True
-            self.overlay.scroll_active = self.edge.current_zone if self.edge.active else 0
+            self.overlay.scroll_active = self.edge.current_zone if self.edge.active else SCROLL_NONE
         else:
             self.overlay.scroll_zones = False
+            self.overlay.scroll_active = SCROLL_NONE
 
         # Feedback rendering
-        if gx is not None:
+        if gx is not None and gy is not None:
             self.overlay.cursor_px = (
                 self._geo.x() + int(gx * self._geo.width()),
                 self._geo.y() + int(gy * self._geo.height())
@@ -1202,6 +1409,6 @@ class GazeInteractionController(QObject):
         self.overlay.update()
         self.mode.board.set_highlight(target, self.activation.progress)
 
-        extra = getattr(self.mode, "suggestions_board", None)
+        extra = self.mode.suggestions_board
         if extra is not None:
             extra.set_highlight(target, self.activation.progress)

@@ -1,9 +1,7 @@
 """System actuation: OS cursor movement, clicking, scrolling, and typing.
 
 The gaze UI executes OS-level actions without taking window focus, injecting
-input directly into the user's active application. This capability is isolated 
-behind a Protocol to enable headless testing (via ``NullActuator``) and graceful 
-degradation if actual actuators can't be properly set up.
+input directly into the user's active application.
 """
 
 from __future__ import annotations
