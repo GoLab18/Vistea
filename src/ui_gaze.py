@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Final, Literal, Protocol, assert_never
+from typing import Final, Literal, Protocol, assert_never
 
 from PySide6.QtCore import QByteArray, QObject, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPaintEvent, QPainter, QPen, QScreen
@@ -149,6 +149,8 @@ class Ctl(str, Enum):
     PAGE_UP = "ctl:pgup"
     PAGE_DOWN = "ctl:pgdn"
     KEYBOARD = "ctl:kbd"
+    SCROLL_ZONES = "ctl:scrollzones"
+    BAR_SIDE = "ctl:barside"
 
 
 ICON_FILES: Final[dict[str, str]] = {
@@ -612,21 +614,41 @@ class KeyboardWindow(TileBoardWindow):
 
 
 class BrowserBar(TileBoardWindow):
-    """Right-docked vertical strip for navigation mode."""
+    """Side-docked vertical strip for navigation mode."""
 
     SPECS: tuple[tuple[str, str], ...] = (
         (Ctl.BACK, "BACK"), (Ctl.FORWARD, "FWD"), (Ctl.PAGE_UP, "PG UP"),
-        (Ctl.PAGE_DOWN, "PG DN"), (Ctl.KEYBOARD, "KEYB"), (Ctl.EXIT, "EXIT"),
+        (Ctl.PAGE_DOWN, "PG DN"), (Ctl.SCROLL_ZONES, "ZONES"),
+        (Ctl.BAR_SIDE, "SIDE"), (Ctl.KEYBOARD, "KEYB"), (Ctl.EXIT, "EXIT"),
     )
 
     def __init__(self, screen: QScreen, min_tile_px: int) -> None:
         super().__init__(screen)
-        geo = screen.geometry()
-        tile = min(max(min_tile_px, 90), (geo.height() - 20) // len(self.SPECS))
-        x0 = geo.x() + geo.width() - tile - 8
+        self._min_tile_px = min_tile_px
+        self.side: DockSide = DockSide.RIGHT
+        self._relayout()
+
+    def _relayout(self) -> None:
+        geo = self._screen.geometry()
+        tile = min(max(self._min_tile_px, 90), (geo.height() - 20) // len(self.SPECS))
+        if self.side is DockSide.LEFT:
+            x0 = geo.x() + 8
+        else:
+            x0 = geo.x() + geo.width() - tile - 8
         y0 = geo.y() + (geo.height() - tile * len(self.SPECS)) // 2
         self.setGeometry(x0, y0, tile + 4, tile * len(self.SPECS) + 4)
-        self.tiles = [Tile(tid, label, QRect(x0, y0 + i * tile, tile, tile)) for i, (tid, label) in enumerate(self.SPECS)]
+        self.tiles = [
+            Tile(tid, label, QRect(x0, y0 + i * tile, tile, tile))
+            for i, (tid, label) in enumerate(self.SPECS)
+        ]
+        self.update()
+
+    def toggle_side(self) -> DockSide:
+        """Move the bar to the opposite screen edge, freeing what it covered."""
+
+        self.side = DockSide.LEFT if self.side is DockSide.RIGHT else DockSide.RIGHT
+        self._relayout()
+        return self.side
 
 
 class SuggestionBar(TileBoardWindow):
@@ -748,9 +770,6 @@ class GazeOverlay(QWidget):
         self.scroll_active: ScrollDirection = SCROLL_NONE
         self.scroll_zone_frac = 0.12
 
-        # When set (0.0 - 1.0), a single bias-recalibration target is drawn at the
-        # screen center with a progress ring reflecting collected fixation
-        # frames. None hides it (normal interaction).
         self.recal_target_progress: float | None = None
         self.recal_message: str = ""
         self.recal_armed: bool = False
@@ -777,9 +796,14 @@ class GazeOverlay(QWidget):
         if self.scroll_zones:
             band = int(self.scroll_zone_frac * h)
             for sign, y in ((SCROLL_UP, 0), (SCROLL_DOWN, h - band)):
-                col = QColor(ACCENT_ACTIVE if self.scroll_active == sign else ACCENT)
-                col.setAlpha(70 if self.scroll_active == sign else 28)
+                active = self.scroll_active == sign
+                col = QColor(ACCENT_ACTIVE if active else ACCENT)
+                col.setAlpha(70 if active else 10)
                 painter.fillRect(0, y, w, band, col)
+
+                edge_col = QColor(ACCENT_ACTIVE if active else ACCENT)
+                edge_col.setAlpha(200 if active else 90)
+                painter.fillRect(0, 0 if sign == SCROLL_UP else h - 3, w, 3, edge_col)
 
         painter.setPen(QColor(255, 255, 255, 200))
         painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
@@ -1106,6 +1130,13 @@ class NavigationMode:
             self._scroll_at_content(+12)
         elif tile_id == Ctl.PAGE_DOWN:
             self._scroll_at_content(-12)
+        elif tile_id == Ctl.SCROLL_ZONES:
+            if self._on_toggle_zones is not None:
+                enabled = self._on_toggle_zones()
+                rlog.event("scroll_zones_toggled", enabled=enabled)
+        elif tile_id == Ctl.BAR_SIDE:
+            side = self.board.toggle_side()
+            rlog.event("nav_bar_moved", side=side.value)
         elif tile_id == Ctl.KEYBOARD:
             return ModeAction.TO_KEYBOARD
         elif tile_id == Ctl.EXIT:
@@ -1184,7 +1215,16 @@ class GazeInteractionController(QObject):
         if floor_unmet:
             self.notify("Keyboard below accuracy floor - consider recalibrating", "warning")
 
-    RECAL_TIMEOUT_S: Final[float] = 4.0
+    RECAL_TARGET: Final[NormalizedPoint] = NormalizedPoint(0.5, 0.5)
+
+    def toggle_scroll_zones(self) -> bool:
+        """Switch edge scrolling on or off, and announce the result."""
+
+        enabled = self.edge.set_enabled(not self.edge.enabled)
+        self.notify(
+            "Scroll zones on" if enabled else "Scroll zones off - edges are clickable"
+        )
+        return enabled
 
     def _enter_recal(self) -> None:
         """Begin guided single-point recalibration: normal activation is
@@ -1363,8 +1403,8 @@ class GazeInteractionController(QObject):
                 if extra is not None and extra.isVisible():
                     target = extra.hit_test(px, py)
 
-            if target is None and self.mode.edge_scroll and self.edge.current_zone == 0:
-                # Navigation mode: dwelling on plain screen.
+            if target is None and self.mode.edge_scroll and self.edge.current_zone == SCROLL_NONE:
+                # Navigation mode: dwelling on plain screen
                 target = SCREEN_CLICK
 
         if fix.fixating and target is not None and target.startswith((KEY_PREFIX, "ctl:")):
@@ -1395,7 +1435,9 @@ class GazeInteractionController(QObject):
 
         if self.mode.edge_scroll:
             was_active = self.edge.active
-            ticks = self.edge.update(gy, t)
+            # A tile drawn inside a band belongs to the board, not the gesture
+            over_widget = target is not None and target != SCREEN_CLICK
+            ticks = self.edge.update(gy, t, suppressed=over_widget)
             if ticks and gx is not None and gy is not None:
                 # The OS scroll wheel acts on whatever is under the real
                 # cursor, so move it under the current gaze point first.
@@ -1409,7 +1451,7 @@ class GazeInteractionController(QObject):
                     direction="up" if self.edge.current_zone == SCROLL_UP else "down",
                     level=logging.DEBUG
                 )
-            self.overlay.scroll_zones = True
+            self.overlay.scroll_zones = self.edge.enabled
             self.overlay.scroll_active = self.edge.current_zone if self.edge.active else SCROLL_NONE
         else:
             self.overlay.scroll_zones = False

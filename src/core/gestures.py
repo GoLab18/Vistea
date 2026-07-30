@@ -23,19 +23,21 @@ class EdgeScrollDetector:
 
     def __init__(
         self,
-        zone: float = 0.12,          # Band height as a fraction of the screen (0.0 to 1.0)
+        zone: float = 0.08,          # Band height as a fraction of the screen (0.0 - 1.0)
         entry_delay: float = 0.4,    # Seconds required inside the band before arming
         tick_interval: float = 0.12, # Seconds between consecutive wheel ticks while active
         hysteresis: float = 0.05,    # Extra band depth added to the exit boundary (prevents boundary jitter)
         grace: float = 0.3,          # Seconds of signal loss tolerated without resetting the gesture
+        enabled: bool = True,        # Gesture switched off entirely, freeing the bands for clicking
     ) -> None:
         self.zone = zone
         self.entry_delay = entry_delay
         self.tick_interval = tick_interval
         self.hysteresis = hysteresis
         self.grace = grace
+        self.enabled = enabled
 
-        self._zone_sign: ScrollDirection = SCROLL_NONE 
+        self._zone_sign: ScrollDirection = SCROLL_NONE
         self._entered_at: float | None = None
         self._active: bool = False
         self._last_tick: float | None = None
@@ -73,10 +75,27 @@ class EdgeScrollDetector:
             return SCROLL_DOWN
         return SCROLL_NONE
 
-    def update(self, y: float | None, t: float) -> int:
+    def set_enabled(self, enabled: bool) -> bool:
+        """Turn the gesture on or off, clearing state on the way out."""
+
+        self.enabled = enabled
+        if not enabled:
+            self.reset()
+        return self.enabled
+
+    def update(self, y: float | None, t: float, suppressed: bool = False) -> int:
         """
         Updates the gesture state machine and returns the number of scroll ticks to emit.
+
+        `suppressed` marks a frame where the gaze belongs to something else
+        rather than the gesture.
         """
+
+        if not self.enabled:
+            return 0
+
+        if suppressed:
+            y = 0.5  # Outside both bands
 
         if y is None:
             if self._lost_since is None:

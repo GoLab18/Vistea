@@ -81,7 +81,7 @@ def test_brief_signal_loss_during_active_scroll_freezes_without_burst() -> None:
     assert ticks_during_fade == 0
     assert det.active # state preserved, not reset
 
-    # signal returns right after the fade began: the fade duration must not
+    # Signal returns right after the fade began: the fade duration must not
     # count toward tick_interval, so this single frame yields no backlog.
     ticks_after = det.update(0.05, t_call + 0.06)
     assert ticks_after in (0, 1)
@@ -103,4 +103,43 @@ def test_brief_signal_loss_during_arming_freezes_entry_delay() -> None:
     # single frame right after the fade must not be enough to arm yet
     ticks = det.update(0.05, t + 0.1)
     assert ticks == 0
+    assert not det.active
+
+def test_disabled_detector_never_ticks() -> None:
+    det = EdgeScrollDetector(zone=0.12, entry_delay=0.4, enabled=False)
+    assert sum(det.update(0.05, t * 0.1) for t in range(30)) == 0
+    assert det.current_zone == SCROLL_NONE
+    assert not det.active
+
+
+def test_set_enabled_toggles_and_clears_state() -> None:
+    det = EdgeScrollDetector(zone=0.12, entry_delay=0.4)
+    for t in range(30):
+        det.update(0.05, t * 0.05)
+    assert det.active
+
+    assert det.set_enabled(False) is False
+    assert not det.active
+    assert det.current_zone == SCROLL_NONE
+
+    assert det.set_enabled(True) is True
+
+
+def test_suppressed_frames_count_as_being_outside_the_band() -> None:
+    det = EdgeScrollDetector(zone=0.12, entry_delay=0.4)
+    ticks = sum(det.update(0.05, t * 0.05, suppressed=True) for t in range(30))
+
+    assert ticks == 0
+    assert det.current_zone == SCROLL_NONE
+
+
+def test_suppression_disarms_an_active_gesture() -> None:
+    det = EdgeScrollDetector(zone=0.12, entry_delay=0.4, tick_interval=0.12)
+    t = 0.0
+    while t <= 1.0:
+        det.update(0.05, t)
+        t += 0.02
+    assert det.active
+
+    assert det.update(0.05, 1.05, suppressed=True) == 0
     assert not det.active
