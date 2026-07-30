@@ -20,7 +20,12 @@ from core import research_log as rlog
 from core.activation import ActivationStrategy, extract_blink_score
 from core.actuator import SystemActuator
 from core.calibration import CalibrationStrategy, NormalizedPoint
-from core.drift import BiasRecalibration, DriftCorrector, min_tile_side_px
+from core.drift import (
+    DriftCorrector,
+    RecalibrationSession,
+    RecalPhase,
+    min_tile_side_px,
+)
 from core.fixation import IDTFixationDetector
 from core.gestures import SCROLL_DOWN, SCROLL_NONE, SCROLL_UP, EdgeScrollDetector, ScrollDirection
 from core.suggestions import Suggestion, SuggestionEngine
@@ -747,6 +752,8 @@ class GazeOverlay(QWidget):
         # screen center with a progress ring reflecting collected fixation
         # frames. None hides it (normal interaction).
         self.recal_target_progress: float | None = None
+        self.recal_message: str = ""
+        self.recal_armed: bool = False
 
         self._toasts: list[ToastMessage] = []
 
@@ -804,15 +811,28 @@ class GazeOverlay(QWidget):
 
         if self.recal_target_progress is not None:
             cx, cy = w // 2, h // 2
-            painter.setPen(QPen(ACCENT, 2))
-            painter.drawEllipse(cx - 22, cy - 22, 44, 44)
-            painter.setBrush(ACCENT_ACTIVE)
-            painter.setPen(QPen(ACCENT_ACTIVE, 1))
-            painter.drawEllipse(cx - 6, cy - 6, 12, 12)
+
+            if self.recal_message:
+                painter.setPen(QColor(235, 235, 240))
+                painter.setFont(QFont("Arial", 15, QFont.Weight.Bold))
+                painter.drawText(
+                    QRect(0, cy - 110, w, 32),
+                    Qt.AlignmentFlag.AlignHCenter,
+                    self.recal_message,
+                )
+
+            if self.recal_armed:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(ACCENT, 2))
+                painter.drawEllipse(cx - 22, cy - 22, 44, 44)
+                painter.setBrush(ACCENT_ACTIVE)
+                painter.setPen(QPen(ACCENT_ACTIVE, 1))
+                painter.drawEllipse(cx - 6, cy - 6, 12, 12)
+
             prog = max(0.0, min(1.0, self.recal_target_progress))
             if prog > 0.0:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(ACCENT_ACTIVE, 4))
+                painter.setPen(QPen(ACCENT_ACTIVE if self.recal_armed else ACCENT, 4))
                 painter.drawArc(cx - 30, cy - 30, 60, 60, 90 * 16, -int(360 * 16 * prog))
 
         if self.cursor_px is None:
@@ -1143,8 +1163,7 @@ class GazeInteractionController(QObject):
         self.workarea: WorkAreaReservation | None = None
         self.keyboard.pin_toggled.connect(self._on_pin_toggled)
 
-        self._recal: BiasRecalibration | None = None
-        self._recal_deadline: float | None = None
+        self._recal: RecalibrationSession | None = None
         self._gaze_bias: NormalizedPoint | None = None
 
         # Head-pose-drift suggestion: nudge the user toward RECAL once per
@@ -1168,28 +1187,25 @@ class GazeInteractionController(QObject):
     RECAL_TIMEOUT_S: Final[float] = 4.0
 
     def _enter_recal(self) -> None:
-        """Begin single-point recalibration: draw a central target and suspend
-        normal activation while gaze predictions are gathered for the offset."""
+        """Begin guided single-point recalibration: normal activation is
+        suspended while the session walks the user through the stages."""
 
-        self._recal = BiasRecalibration()
-        self._recal_deadline = time.monotonic() + self.RECAL_TIMEOUT_S
+        self._recal = RecalibrationSession(self.RECAL_TARGET, time.monotonic())
         self.overlay.recal_target_progress = 0.0
+        self.overlay.recal_message = ""
         self.activation.reset()
         self.fixation.reset()
         self.overlay.update()
 
-    def _finish_recal(self, applied: bool) -> None:
+    def _finish_recal(self, status_message: str, applied: bool) -> None:
         self._recal = None
-        self._recal_deadline = None
         self.overlay.recal_target_progress = None
+        self.overlay.recal_message = ""
         self.activation.reset()
         self.fixation.reset()
         self.overlay.update()
 
-        if applied:
-            self.notify("Recalibrated", "info")
-        else:
-            self.notify("Recalibration cancelled", "warning")
+        self.notify(status_message, "info" if applied else "warning")
 
     def note_pose_drift(self) -> None:
         """Record a head-pose drift transition. On the third one this session,
@@ -1276,22 +1292,22 @@ class GazeInteractionController(QObject):
         )
 
     def _run_recalibration(self, gaze: NormalizedPoint | None, t: float) -> None:
-        """Collect fixation-frame predictions against the central target while
-        recalibration is active."""
+        """Drive one frame of the recalibration session."""
 
         recal = self._recal
         if recal is None:
             return
-        target = NormalizedPoint(0.5, 0.5)
 
         gx = gy = None
         if gaze is not None:
             gx, gy = gaze.x, gaze.y
         fix = self.fixation.update(gx, gy, t)
-        if fix.fixating and gaze is not None:
-            recal.feed(gaze)
 
-        self.overlay.recal_target_progress = min(1.0, recal.n_fed / recal.MIN_FRAMES)
+        status = recal.update(gaze, fix.fixating, t)
+
+        self.overlay.recal_target_progress = status.progress
+        self.overlay.recal_message = status.message
+        self.overlay.recal_armed = status.phase is not RecalPhase.PROMPT
         self.overlay.cursor_px = (
             self._geo.x() + int(gx * self._geo.width()),
             self._geo.y() + int(gy * self._geo.height()),
@@ -1300,20 +1316,21 @@ class GazeInteractionController(QObject):
         self.overlay.progress = 0.0
         self.overlay.update()
 
-        timed_out = self._recal_deadline is not None and t >= self._recal_deadline
-        offset = recal.compute(target)
-        if offset is not None:
+        if not status.finished:
+            return
+
+        if status.phase is RecalPhase.DONE and status.offset is not None:
             prev = self._gaze_bias or NormalizedPoint(0.0, 0.0)
-            self._gaze_bias = NormalizedPoint(prev.x + offset[0], prev.y + offset[1])
+            self._gaze_bias = NormalizedPoint(prev.x + status.offset[0], prev.y + status.offset[1])
             rlog.event(
                 "drift_recalibration",
                 offset_x=round(self._gaze_bias.x, 5),
                 offset_y=round(self._gaze_bias.y, 5),
-                n_frames=recal.n_fed,
+                n_frames=recal.n_frames,
             )
-            self._finish_recal(applied=True)
-        elif timed_out:
-            self._finish_recal(applied=False)
+            self._finish_recal(status.message, applied=True)
+        else:
+            self._finish_recal(status.message, applied=False)
 
     def on_gaze(self, gaze: NormalizedPoint | None, data: LandmarksData,
                 vec: list[float] | None) -> None:

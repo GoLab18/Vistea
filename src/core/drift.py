@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Final
 
 from core.calibration import CalibrationStrategy, NormalizedPoint
 
@@ -108,10 +111,20 @@ class BiasRecalibration:
     def n_fed(self) -> int:
         return len(self._preds)
 
+    @property
+    def predictions(self) -> list[NormalizedPoint]:
+        return self._preds
+
     def feed(self, prediction: NormalizedPoint) -> None:
         """Collects one prediction while the user fixates the recalibration target."""
 
         self._preds.append(prediction)
+
+    def drop_oldest_half(self) -> None:
+        """Discard the older half of the batch, keeping the most recent frames."""
+
+        if self._preds:
+            self._preds = self._preds[len(self._preds) // 2:]
 
     def compute(self, target: NormalizedPoint) -> tuple[float, float] | None:
         """Offset (target minus mean prediction) in normalized units, or None
@@ -127,3 +140,133 @@ class BiasRecalibration:
 
     def reset(self) -> None:
         self._preds.clear()
+
+
+class RecalPhase(str, Enum):
+    """Stage of a guided recalibration session."""
+
+    PROMPT = "prompt"          # Explaining what is about to happen
+    ARMED = "armed"            # Target shown, waiting for the user to fixate it
+    COLLECTING = "collecting"  # Gathering predictions against the target
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class RecalStatus:
+    """One frame's view of a recalibration session, for rendering."""
+
+    phase: RecalPhase
+    progress: float  # (0.0 - 1.0)
+    message: str
+    offset: tuple[float, float] | None = None
+
+    @property
+    def finished(self) -> bool:
+        return self.phase in (RecalPhase.DONE, RecalPhase.CANCELLED)
+
+
+class RecalibrationSession:
+    """Guided single-point recalibration."""
+
+    PROMPT_S: Final[float] = 2.5         # Time to read the instruction
+    ARM_TIMEOUT_S: Final[float] = 12.0   # Give up if no fixation ever settles
+    HOLD_TO_START_S: Final[float] = 0.4  # Steady fixation before collecting
+    LOST_GRACE_S: Final[float] = 0.5     # Fixation gaps tolerated mid-collection
+    MAX_SPREAD: Final[float] = 0.05      # Dispersion allowed within the batch
+
+    def __init__(self, target: NormalizedPoint, started_at: float) -> None:
+        self.target = target
+        self._t0 = started_at
+        self._phase = RecalPhase.PROMPT
+        self._bias = BiasRecalibration()
+        self._held_since: float | None = None
+        self._lost_since: float | None = None
+        self._offset: tuple[float, float] | None = None
+
+    @property
+    def phase(self) -> RecalPhase:
+        return self._phase
+
+    def _batch_is_tight(self) -> bool:
+        """Whether the collected predictions form one cluster. This is the quality gate
+        of full calibration applied to a single point.
+        """
+
+        preds = self._bias.predictions
+        if len(preds) < 2:
+            return False
+        return (
+            max(p.x for p in preds) - min(p.x for p in preds) <= self.MAX_SPREAD
+            and max(p.y for p in preds) - min(p.y for p in preds) <= self.MAX_SPREAD
+        )
+
+    def _cancel(self, reason: str) -> RecalStatus:
+        self._phase = RecalPhase.CANCELLED
+        return RecalStatus(self._phase, 0.0, reason)
+
+    def update(self, gaze: NormalizedPoint | None, fixating: bool, t: float) -> RecalStatus:
+        """Advance the session by one frame and describe what to draw."""
+
+        elapsed = t - self._t0
+
+        if self._phase is RecalPhase.PROMPT:
+            if elapsed < self.PROMPT_S:
+                return RecalStatus(
+                    self._phase,
+                    min(1.0, elapsed / self.PROMPT_S),
+                    "Recalibration - look at the dot in the centre of the screen",
+                )
+            self._phase = RecalPhase.ARMED
+            self._t0 = t
+            elapsed = 0.0
+
+        settled = gaze is not None and fixating
+
+        if self._phase is RecalPhase.ARMED:
+            if not settled:
+                self._held_since = None
+                if elapsed > self.ARM_TIMEOUT_S:
+                    return self._cancel("Recalibration cancelled - gaze never settled")
+                return RecalStatus(self._phase, 0.0, "Look at the dot and hold your gaze on it")
+
+            if self._held_since is None:
+                self._held_since = t
+            held = t - self._held_since
+            if held < self.HOLD_TO_START_S:
+                return RecalStatus(
+                    self._phase, held / self.HOLD_TO_START_S, "Hold your gaze on the dot"
+                )
+
+            self._phase = RecalPhase.COLLECTING
+            self._lost_since = None
+
+        if settled and gaze is not None:
+            self._bias.feed(gaze)
+            self._lost_since = None
+        else:
+            if self._lost_since is None:
+                self._lost_since = t
+            elif t - self._lost_since > self.LOST_GRACE_S:
+                self._phase = RecalPhase.ARMED
+                self._t0 = t
+                self._held_since = None
+                self._bias.reset()
+                return RecalStatus(self._phase, 0.0, "Gaze lost - look at the dot again")
+
+        progress = min(1.0, self._bias.n_fed / BiasRecalibration.MIN_FRAMES)
+        offset = self._bias.compute(self.target)
+        if offset is None:
+            return RecalStatus(self._phase, progress, "Keep looking at the dot")
+
+        if not self._batch_is_tight():
+            self._bias.drop_oldest_half()
+            return RecalStatus(self._phase, 0.0, "Hold still - keep looking at the dot")
+
+        self._offset = offset
+        self._phase = RecalPhase.DONE
+        return RecalStatus(self._phase, 1.0, "Recalibrated", offset)
+
+    @property
+    def n_frames(self) -> int:
+        return self._bias.n_fed

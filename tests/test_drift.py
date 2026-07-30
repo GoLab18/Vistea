@@ -5,7 +5,13 @@ from __future__ import annotations
 import math
 
 from core.calibration import NormalizedPoint, PolynomialRidgeCalibration, make_grid
-from core.drift import BiasRecalibration, DriftCorrector, min_tile_side_px
+from core.drift import (
+    BiasRecalibration,
+    DriftCorrector,
+    RecalibrationSession,
+    RecalPhase,
+    min_tile_side_px,
+)
 
 
 def _calibrated_strategy() -> PolynomialRidgeCalibration:
@@ -115,3 +121,133 @@ def test_bias_recalibration_reset_clears_predictions() -> None:
     recal.reset()
     assert recal.n_fed == 0
     assert recal.compute(NormalizedPoint(0.5, 0.5)) is None
+
+
+CENTER = NormalizedPoint(0.5, 0.5)
+
+
+def _run_recal_session(session: RecalibrationSession, gaze, fixating, t0, steps, dt=0.05):
+    status = None
+    for i in range(steps):
+        status = session.update(gaze, fixating, t0 + i * dt)
+    assert status is not None
+    return status
+
+
+def test_session_shows_a_prompt_before_measuring_anything() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    status = session.update(CENTER, True, 0.5)
+
+    assert status.phase is RecalPhase.PROMPT
+    assert status.message
+    assert session.n_frames == 0
+
+
+def test_prompt_gives_way_to_an_armed_target() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    session.update(None, False, 0.5)
+    status = session.update(None, False, RecalibrationSession.PROMPT_S + 0.01)
+
+    assert status.phase is RecalPhase.ARMED
+    assert session.n_frames == 0
+
+
+def test_collection_starts_only_after_a_held_fixation_on_the_target() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    t = RecalibrationSession.PROMPT_S + 0.01
+    session.update(None, False, t)
+
+    # Fixating, but not long enough to be deliberate
+    status = session.update(CENTER, True, t + 0.1)
+    assert status.phase is RecalPhase.ARMED
+    assert session.n_frames == 0
+
+    status = _run_recal_session(session, CENTER, True, t + 0.2, steps=4, dt=0.2)
+    assert status.phase in (RecalPhase.COLLECTING, RecalPhase.DONE)
+
+
+def test_large_bias_is_corrected_not_refused() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    t = RecalibrationSession.PROMPT_S + 0.01
+    session.update(None, False, t)
+
+    # A badly degraded model maps the screen center far into the corner
+    far = NormalizedPoint(0.18, 0.83)
+    status = _run_recal_session(session, far, True, t, steps=40, dt=0.05)
+
+    assert status.phase is RecalPhase.DONE
+    assert status.offset is not None
+    assert math.isclose(status.offset[0], 0.32, abs_tol=1e-9)
+    assert math.isclose(status.offset[1], -0.33, abs_tol=1e-9)
+
+
+def test_wandering_gaze_does_not_produce_an_offset() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    t = RecalibrationSession.PROMPT_S + 0.01
+    session.update(None, False, t)
+
+    status = None
+    for i in range(40):
+        drifting = NormalizedPoint(0.30 + 0.02 * i, 0.30 + 0.02 * i)
+        status = session.update(drifting, True, t + i * 0.05)
+
+    assert status is not None
+    assert status.phase is RecalPhase.COLLECTING
+    assert status.offset is None
+
+
+def test_session_cancels_when_the_target_is_never_fixated() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    session.update(None, False, RecalibrationSession.PROMPT_S + 0.01)
+
+    status = session.update(None, False, RecalibrationSession.PROMPT_S + 20.0)
+    assert status.phase is RecalPhase.CANCELLED
+    assert status.finished
+    assert status.offset is None
+
+
+def test_completed_session_yields_the_offset_that_cancels_the_shift() -> None:
+    session = RecalibrationSession(CENTER, 0.0)
+    t = RecalibrationSession.PROMPT_S + 0.01
+    session.update(None, False, t)
+
+    shifted = NormalizedPoint(0.56, 0.46)  # predictions land right and high
+    status = _run_recal_session(session, shifted, True, t, steps=40, dt=0.05)
+
+    assert status.phase is RecalPhase.DONE
+    assert status.offset is not None
+    assert math.isclose(status.offset[0], -0.06, abs_tol=1e-9)
+    assert math.isclose(status.offset[1], 0.04, abs_tol=1e-9)
+
+
+def _armed_and_collecting(steps: int = 14) -> tuple[RecalibrationSession, float]:
+    session = RecalibrationSession(CENTER, 0.0)
+    t = RecalibrationSession.PROMPT_S + 0.01
+    session.update(None, False, t)
+    _run_recal_session(session, CENTER, True, t, steps=steps, dt=0.05)
+    assert session.phase is RecalPhase.COLLECTING
+    return session, t + steps * 0.05
+
+
+def test_a_blink_mid_collection_does_not_discard_the_samples() -> None:
+    session, t = _armed_and_collecting()
+    before = session.n_frames
+    assert before > 0
+
+    # Blink, inside the grace window
+    session.update(None, False, t + 0.05)
+    status = session.update(CENTER, True, t + 0.10)
+
+    assert session.n_frames > before
+    assert status.phase is not RecalPhase.ARMED
+
+
+def test_losing_the_gaze_for_too_long_rearms_and_drops_partial_samples() -> None:
+    session, t = _armed_and_collecting()
+    assert session.n_frames > 0
+
+    session.update(None, False, t + 0.05)
+    status = session.update(None, False, t + 0.05 + RecalibrationSession.LOST_GRACE_S + 0.1)
+
+    assert status.phase is RecalPhase.ARMED
+    assert session.n_frames == 0
