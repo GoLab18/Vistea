@@ -57,9 +57,16 @@ LEFT_EYE_LIDS: Final[tuple[int, int]] = (386, 374)      # upper, lower
 # a frame is treated as a blink and excluded from calibration / gaze estimation.
 MIN_EYE_OPENNESS: Final[float] = 0.10
 
-# Fraction of the user's own resting openness below which the lid is treated as
-# mid-motion (closing or reopening).
+# Fraction of the user's own resting openness below which the lid is a candidate
+# for being mid-motion (closing or reopening).
 LID_STABLE_FRACTION: Final[float] = 0.80
+
+# Openness change per second that separates a travelling lid from an eye that
+# is just held narrower.
+LID_MOTION_RATE: Final[float] = 1.2
+
+# Longest the gate may keep withholding frames.
+LID_MAX_HOLD_S: Final[float] = 0.5
 
 
 @dataclass(frozen=True)
@@ -148,10 +155,19 @@ class EyelidStabilityGate:
         self,
         stable_fraction: float = LID_STABLE_FRACTION,
         adapt_rate: float = 0.02,
+        motion_rate: float = LID_MOTION_RATE,
+        max_hold_s: float = LID_MAX_HOLD_S,
+        closed_openness: float = MIN_EYE_OPENNESS,
     ) -> None:
         self.stable_fraction = stable_fraction
         self.adapt_rate = adapt_rate
+        self.motion_rate = motion_rate
+        self.max_hold_s = max_hold_s
+        self.closed_openness = closed_openness
+
         self._baseline: float | None = None
+        self._last: tuple[float, float] | None = None  # (t, openness)
+        self._unstable_since: float | None = None
 
     @property
     def baseline(self) -> float | None:
@@ -159,19 +175,57 @@ class EyelidStabilityGate:
 
     def reset(self) -> None:
         self._baseline = None
+        self._last = None
+        self._unstable_since = None
 
-    def update(self, openness: float) -> bool:
-        """Update current stability based on the given openness ratio.
-        Returns True when the lid is settled."""
+    def _rate(self, openness: float, t: float) -> float | None:
+        """Absolute openness change per second since the previous frame."""
+
+        if self._last is None:
+            return None
+        prev_t, prev_openness = self._last
+        dt = t - prev_t
+        if dt <= 0.0:
+            return None
+        return abs(openness - prev_openness) / dt
+
+    def _settle(self, openness: float) -> bool:
+        """Accept the frame and let the baseline follow it."""
+
+        self._unstable_since = None
+        if self._baseline is not None:
+            self._baseline += self.adapt_rate * (openness - self._baseline)
+        return True
+
+    def update(self, openness: float, t: float) -> bool:
+        """Update current stability based on the given openness ratio and
+        timestamp in seconds. Returns True when the lid is settled."""
+
+        rate = self._rate(openness, t)
+        self._last = (t, openness)
 
         if self._baseline is None:
             self._baseline = openness
             return True
 
-        stable = openness >= self._baseline * self.stable_fraction
-        if stable:
-            self._baseline += self.adapt_rate * (openness - self._baseline)
-        return stable
+        if openness < self.closed_openness:
+            self._unstable_since = None
+            return False
+
+        if openness >= self._baseline * self.stable_fraction:
+            return self._settle(openness)
+
+        # Narrowed: might be still travelling, or being held there
+        if rate is not None and rate < self.motion_rate:
+            return self._settle(openness)
+
+        if self._unstable_since is None:
+            self._unstable_since = t
+        elif t - self._unstable_since >= self.max_hold_s:
+            self._baseline = openness
+            self._unstable_since = None
+            return True
+        return False
 
 
 @dataclass
@@ -328,7 +382,7 @@ class GazeEstimator:
         eyes_open = left_open > MIN_EYE_OPENNESS and right_open > MIN_EYE_OPENNESS
 
         data.eye_openness = (left_open + right_open) / 2.0
-        data.lids_stable = self.lid_gate.update(data.eye_openness)
+        data.lids_stable = self.lid_gate.update(data.eye_openness, timestamp_ms / 1000.0)
 
         if left is not None and right is not None and eyes_open:
             data.gaze_valid = True
