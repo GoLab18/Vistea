@@ -165,3 +165,40 @@ def test_activation_kind_serializes_to_plain_string_not_repr() -> None:
     payload = json.dumps({"kind": ActivationKind.DWELL, "target": "key:a"})
     assert json.loads(payload)["kind"] == "dwell"
     assert "ActivationKind" not in payload
+
+def test_blink_activates_the_target_seen_before_the_lid_moved() -> None:
+    act = BlinkActivation(min_blink=0.35, max_blink=1.2, pre_blink_lag=0.25)
+
+    t = 0.0
+    while t < 0.5:
+        act.update("key:a", True, 0.0, t)
+        t += 0.05
+
+    # Closing phase: gaze slides onto the key one row below
+    act.update("key:z", True, 0.2, 0.55)
+    act.update("key:z", True, 0.4, 0.60)
+
+    act.update(None, False, 0.9, 0.65)   # Eyes shut
+    ev = act.update("key:a", True, 0.05, 1.10)  # Reopened after 0.45 s
+
+    assert ev is not None
+    assert ev.target_id == "key:a"
+
+
+def test_blink_falls_back_to_the_oldest_remembered_target() -> None:
+    act = BlinkActivation(min_blink=0.35, max_blink=1.2, pre_blink_lag=0.25)
+
+    act.update("key:a", True, 0.0, 0.0)
+    act.update(None, False, 0.9, 0.05)
+    ev = act.update("key:a", True, 0.05, 0.50)
+
+    assert ev is not None and ev.target_id == "key:a"
+
+
+def test_blink_reset_clears_the_target_history() -> None:
+    act = BlinkActivation(min_blink=0.35, max_blink=1.2)
+    act.update("key:a", True, 0.0, 0.0)
+    act.reset()
+
+    act.update(None, False, 0.9, 0.1)
+    assert act.update(None, False, 0.05, 0.6) is None

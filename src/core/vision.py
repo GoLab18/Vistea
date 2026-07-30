@@ -53,9 +53,13 @@ LEFT_EYE_CORNERS: Final[tuple[int, int]] = (362, 263)   # inner, outer
 RIGHT_EYE_LIDS: Final[tuple[int, int]] = (159, 145)     # upper, lower
 LEFT_EYE_LIDS: Final[tuple[int, int]] = (386, 374)      # upper, lower
 
-# EAR (Eye Aspect Ratio) threshold.Below this eye-openness ratio (lid gap / eye width),
+# EAR (Eye Aspect Ratio) threshold. Below this eye-openness ratio (lid gap / eye width),
 # a frame is treated as a blink and excluded from calibration / gaze estimation.
 MIN_EYE_OPENNESS: Final[float] = 0.10
+
+# Fraction of the user's own resting openness below which the lid is treated as
+# mid-motion (closing or reopening).
+LID_STABLE_FRACTION: Final[float] = 0.80
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,45 @@ def decompose_head_pose(transform_matrix: np.ndarray) -> HeadPose | None:
     return HeadPose(yaw=yaw, pitch=pitch, roll=roll)
 
 
+class EyelidStabilityGate:
+    """
+    Separates a settled eyelid from one that is in motion.
+
+    When the lid travels down, before hitting the openness threshold, it slides
+    the detected iris center out of it's real center position. The baseline is
+    adapted with time through `adapt_rate`.
+    """
+
+    def __init__(
+        self,
+        stable_fraction: float = LID_STABLE_FRACTION,
+        adapt_rate: float = 0.02,
+    ) -> None:
+        self.stable_fraction = stable_fraction
+        self.adapt_rate = adapt_rate
+        self._baseline: float | None = None
+
+    @property
+    def baseline(self) -> float | None:
+        return self._baseline
+
+    def reset(self) -> None:
+        self._baseline = None
+
+    def update(self, openness: float) -> bool:
+        """Update current stability based on the given openness ratio.
+        Returns True when the lid is settled."""
+
+        if self._baseline is None:
+            self._baseline = openness
+            return True
+
+        stable = openness >= self._baseline * self.stable_fraction
+        if stable:
+            self._baseline += self.adapt_rate * (openness - self._baseline)
+        return stable
+
+
 @dataclass
 class LandmarksData:
     """Container for a single frame's processed visual metrics."""
@@ -139,6 +182,9 @@ class LandmarksData:
     gaze_valid: bool = False  # False during blinks or degenerate geometry
     features: GazeFeatures | None = None
     head_pose: HeadPose | None = None
+
+    eye_openness: float | None = None  # Mean lid gap / eye width over both eyes
+    lids_stable: bool = True           # False while a lid is opening or closing
 
     left_iris_px: PixelCoord | None = None
     right_iris_px: PixelCoord | None = None
@@ -200,8 +246,9 @@ class GazeEstimator:
         self.model_path = os.path.join(MODEL_DIR, MODEL_NAME)
         self._ensure_model_exists()
         self.draw_debug = draw_debug
-        
+
         self.preprocessor: FramePreprocessor = NoPreprocessing()
+        self.lid_gate = EyelidStabilityGate()
 
         base_options = python.BaseOptions(model_asset_path=self.model_path)
         options = vision.FaceLandmarkerOptions(
@@ -276,10 +323,12 @@ class GazeEstimator:
             lid_gap = float(np.linalg.norm(pt(lids[0]) - pt(lids[1])))
             return lid_gap / eye_width if eye_width > 1e-6 else 0.0
 
-        eyes_open = (
-            openness(LEFT_EYE_LIDS, LEFT_EYE_CORNERS) > MIN_EYE_OPENNESS
-            and openness(RIGHT_EYE_LIDS, RIGHT_EYE_CORNERS) > MIN_EYE_OPENNESS
-        )
+        left_open = openness(LEFT_EYE_LIDS, LEFT_EYE_CORNERS)
+        right_open = openness(RIGHT_EYE_LIDS, RIGHT_EYE_CORNERS)
+        eyes_open = left_open > MIN_EYE_OPENNESS and right_open > MIN_EYE_OPENNESS
+
+        data.eye_openness = (left_open + right_open) / 2.0
+        data.lids_stable = self.lid_gate.update(data.eye_openness)
 
         if left is not None and right is not None and eyes_open:
             data.gaze_valid = True

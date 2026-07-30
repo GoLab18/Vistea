@@ -9,6 +9,7 @@ All timing relies on monotonic wall-clock seconds, never frame counts.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -160,8 +161,12 @@ class DwellActivation:
 
 class BlinkActivation:
     """
-    Deliberate long blink on a target. 
-    Natural blinks fall below min_blink, resting eyes exceed max_blink.
+    Deliberate long blink on a target.
+    Natural blinks fall below `min_blink`, resting eyes exceed `max_blink`.
+
+    The activated target is the one the user was looking at *before* the lid
+    started moving, not the one under the gaze point at the moment the blink
+    score crosses the closing threshold.
     """
 
     def __init__(
@@ -169,27 +174,47 @@ class BlinkActivation:
         min_blink: float = 0.35,
         max_blink: float = 1.2,
         close_threshold: float = 0.5,
+        pre_blink_lag: float = 0.25,
         name: str = "blink_long",
     ) -> None:
         self.min_blink = min_blink
         self.max_blink = max_blink
         self.close_threshold = close_threshold
+        self.pre_blink_lag = pre_blink_lag
         self.name = name
 
         self._closed_since: float | None = None
         self._locked_target: str | None = None
-        self._last_target: str | None = None
+        self._history: deque[tuple[float, str]] = deque()
         self._progress: float = 0.0
 
     def reset(self) -> None:
         self._closed_since = None
         self._locked_target = None
-        self._last_target = None
+        self._history.clear()
         self._progress = 0.0
 
     @property
     def progress(self) -> float:
         return self._progress
+
+    def _remember(self, target_id: str, t: float) -> None:
+        """Append a seen target, dropping entries older than twice the lag."""
+
+        self._history.append((t, target_id))
+        drop_lim = t - 2.0 * self.pre_blink_lag
+        while self._history and self._history[0][0] < drop_lim:
+            self._history.popleft()
+
+    def _target_before_blink(self, t: float) -> str | None:
+        """The most recent target seen at least `pre_blink_lag` before `t`,
+        falling back to the oldest one still remembered."""
+
+        cutoff = t - self.pre_blink_lag
+        for stamp, tid in reversed(self._history):
+            if stamp <= cutoff:
+                return tid
+        return self._history[0][1] if self._history else None
 
     def update(
         self,
@@ -198,15 +223,14 @@ class BlinkActivation:
         blink_score: float | None,
         t: float,
     ) -> ActivationEvent | None:
-        
         if target_id is not None:
-            self._last_target = target_id
+            self._remember(target_id, t)
 
         closed = blink_score is not None and blink_score >= self.close_threshold
         if closed:
             if self._closed_since is None:
                 self._closed_since = t
-                self._locked_target = self._last_target
+                self._locked_target = self._target_before_blink(t)
             held = t - self._closed_since
             self._progress = min(1.0, held / self.min_blink)
 

@@ -810,16 +810,17 @@ class MainWindow(QMainWindow, L2CSConsumerMixin):
             and data.gaze_valid
         ):
             vec = build_strategy_vector(self.strategy, frame, data, consumer=self)
-            if vec is not None and pose_ok: # pause the cursor while drifted
+            # Cursor paused while the head has drifted, and while a lid is in motion
+            if vec is not None and pose_ok and data.lids_stable:
                 raw = self.strategy.predict(vec)
                 if raw is not None:
                     fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
                     self.latest_gaze = NormalizedPoint(fx, fy)
 
         if self.gaze_controller is not None:
-            # While the head has drifted, the controller receives no gaze point and
-            # the dwell progress freezes instead of accumulating on a mislocated target.
-            gaze = self.latest_gaze if pose_ok else None
+            # Withholding the gaze point (rather than passing a stale one) freezes
+            # dwell progress instead of accumulating it on a mislocated target.
+            gaze = self.latest_gaze if (pose_ok and data.lids_stable) else None
             self.gaze_controller.on_gaze(gaze, data, vec)
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
