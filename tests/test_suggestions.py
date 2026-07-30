@@ -195,3 +195,10 @@ def test_real_pl_corpus_index_builds_and_suggests_within_budget(tmp_path: Path) 
         eng.suggest("rpwer", "PL", k=3)
     avg = (time.perf_counter() - start) / 20.0
     assert avg < 0.020
+
+def test_empty_prefix_yields_no_suggestions(tmp_path: Path) -> None:
+    eng = _engine(tmp_path, en=["the 100", "then 80", "there 60"])
+    eng.add_custom("Vistea")
+
+    assert eng.suggest("", "EN") == []
+    assert eng.suggest("   ", "EN") == []

@@ -239,6 +239,9 @@ class SuggestionEngine:
         """Return up to `k` completions of `prefix` for a language."""
 
         needle = prefix.strip().lower()
+        if not needle:
+            return []
+
         results: list[Suggestion] = []
         seen: set[str] = set()
 
