@@ -28,6 +28,8 @@ from core.drift import (
 )
 from core.fixation import IDTFixationDetector
 from core.gestures import SCROLL_DOWN, SCROLL_NONE, SCROLL_UP, EdgeScrollDetector, ScrollDirection
+from core.hotkeys import HotkeyProfile, NavAction, load_profile
+from core.hotkeys import send as send_hotkey
 from core.suggestions import Suggestion, SuggestionEngine
 from core.vision import LandmarksData
 from core.workarea import WorkAreaReservation, make_reservation
@@ -891,12 +893,14 @@ class KeyboardMode:
     name = "KEYBOARD"
     edge_scroll = False
 
-    def __init__(self, keyboard: KeyboardWindow, drift: DriftCorrector | None, 
-                 actuator: SystemActuator, on_relayout: Callable[[], None] | None = None) -> None:
+    def __init__(self, keyboard: KeyboardWindow, drift: DriftCorrector | None,
+                 actuator: SystemActuator, on_relayout: Callable[[], None] | None = None,
+                 hotkeys: HotkeyProfile | None = None) -> None:
         self.board = keyboard
         self._drift = drift
         self._actuator = actuator
         self._on_relayout = on_relayout
+        self._hotkeys = hotkeys if hotkeys is not None else load_profile()
         root = pathlib.Path(__file__).resolve().parent.parent
 
         user_home = pathlib.Path.home()
@@ -1021,10 +1025,7 @@ class KeyboardMode:
             self._refresh_suggestions()
         elif tile_id == Ctl.DELETE_WORD:
             board.delete_word_preview()
-            if sys.platform == "darwin":
-                self._actuator.hotkey("alt", "backspace")
-            else:
-                self._actuator.hotkey("ctrl", "backspace")
+            send_hotkey(NavAction.DELETE_WORD, self._actuator, self._hotkeys)
             self._refresh_suggestions()
         elif tile_id == Ctl.ENTER:
             text, wpm, elapsed = board.commit_preview()
@@ -1098,10 +1099,19 @@ class NavigationMode:
     name = "NAVIGATION"
     edge_scroll = True
 
-    def __init__(self, bar: BrowserBar, actuator: SystemActuator, dpr: float = 1.0) -> None:
+    def __init__(
+        self,
+        bar: BrowserBar,
+        actuator: SystemActuator,
+        dpr: float = 1.0,
+        hotkeys: HotkeyProfile | None = None,
+        on_toggle_zones: Callable[[], bool] | None = None,
+    ) -> None:
         self.board = bar
         self._actuator = actuator
         self._dpr = dpr
+        self._hotkeys = hotkeys if hotkeys is not None else load_profile()
+        self._on_toggle_zones = on_toggle_zones
         self.suggestions_board: TileBoardWindow | None = None
 
     def enter(self) -> None:
@@ -1119,13 +1129,23 @@ class NavigationMode:
         self._actuator.move(*to_physical(cx, cy, self._dpr))
         self._actuator.scroll(ticks)
 
+    def _navigate(self, action: NavAction) -> None:
+        chord = send_hotkey(action, self._actuator, self._hotkeys)
+        rlog.event(
+            "nav_hotkey",
+            action=action.value,
+            chord="+".join(chord) if chord else None,
+            profile=self._hotkeys.name,
+            level=logging.DEBUG,
+        )
+
     def on_activation(self, tile_id: str) -> ModeAction | None:
         if tile_id == SCREEN_CLICK:
             return ModeAction.CLICK
         if tile_id == Ctl.BACK:
-            self._actuator.hotkey("alt", "left")
+            self._navigate(NavAction.BACK)
         elif tile_id == Ctl.FORWARD:
-            self._actuator.hotkey("alt", "right")
+            self._navigate(NavAction.FORWARD)
         elif tile_id == Ctl.PAGE_UP:
             self._scroll_at_content(+12)
         elif tile_id == Ctl.PAGE_DOWN:
@@ -1172,10 +1192,17 @@ class GazeInteractionController(QObject):
         self.overlay.scroll_zone_frac = self.edge.zone
         self.actuator = actuator
         self.bar = BrowserBar(screen, tile_px)
+        self.hotkeys = load_profile()
 
         self._modes: dict[ModeAction, GazeMode] = {
-            ModeAction.TO_KEYBOARD: KeyboardMode(self.keyboard, self.drift, actuator, self.relayout_pin),
-            ModeAction.TO_NAV: NavigationMode(self.bar, actuator, self._dpr),
+            ModeAction.TO_KEYBOARD: KeyboardMode(
+                self.keyboard, self.drift, actuator, self.relayout_pin,
+                hotkeys=self.hotkeys,
+            ),
+            ModeAction.TO_NAV: NavigationMode(
+                self.bar, actuator, self._dpr,
+                hotkeys=self.hotkeys, on_toggle_zones=self.toggle_scroll_zones,
+            ),
         }
         self.mode: GazeMode = self._modes[ModeAction.TO_KEYBOARD]
 
