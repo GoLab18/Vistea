@@ -1288,8 +1288,9 @@ class GazeInteractionController(QObject):
         (which forces a native window) is only called once the user pins."""
 
         if self.workarea is None:
-            hwnd = int(self.keyboard.winId()) if sys.platform == "win32" else None
-            self.workarea = make_reservation(hwnd)
+            native = sys.platform == "win32" or sys.platform.startswith("linux")
+            handle = self.keyboard.winId() if native else None
+            self.workarea = make_reservation(handle)
         return self.workarea
 
     def _reserve_current_strip(self) -> None:
