@@ -1,9 +1,21 @@
 [project]
 name = "vistea"
 version = "0.1.0"
-description = "Low-cost gaze tracking and control system"
+description = "Low-cost webcam gaze tracking and hands-free screen control"
 readme = "README.md"
 requires-python = ">=3.13"
+keywords = [
+    "eye-tracking",
+    "gaze-estimation",
+    "gaze-interaction",
+    "webcam",
+    "calibration",
+    "accessibility",
+    "assistive-technology",
+    "human-computer-interaction",
+    "mediapipe",
+    "computer-vision",
+]
 dependencies = [
     "mediapipe>=0.10.35",
     "numpy>=2.4.6",
@@ -13,6 +25,11 @@ dependencies = [
     "scikit-learn>=1.9.0",
     "structlog>=26.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/GoLab18/Vistea"
+Repository = "https://github.com/GoLab18/Vistea"
+Issues = "https://github.com/GoLab18/Vistea/issues"
 
 [dependency-groups]
 cnn = [
