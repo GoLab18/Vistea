@@ -2,7 +2,7 @@
 
 Verifies (without PySide6): tile layout for both language layouts and all
 pages, dock/scale/opacity/lock behavior, hit-testing under lock, and the
-KeyboardMode routing into the system actuator (typing into OS focus).
+KeyboardMode routing into the system actuator.
 """
 
 import sys
@@ -68,9 +68,26 @@ def _stub(name: str, **attrs: Any) -> types.ModuleType:
     return m
 
 _noop = lambda *a, **k: types.SimpleNamespace()
+
+
+class QSvgRenderer:
+    def __init__(self, *a: Any, **k: Any): pass
+    def isValid(self) -> bool: return False
+    def render(self, *a: Any) -> None: pass
+
+
 pyside = _stub("PySide6")
-pyside.QtCore = _stub("PySide6.QtCore", QObject=QObject, QRect=QRect, Qt=_Qt(), Signal=Signal)
-pyside.QtGui = _stub("PySide6.QtGui", QColor=_noop, QFont=_noop, QPainter=_noop, QPen=_noop)
+pyside.QtCore = _stub(
+    "PySide6.QtCore",
+    QByteArray=_noop, QObject=QObject, QPoint=QPointS, QRect=QRect,
+    QRectF=QRect, Qt=_Qt(), Signal=Signal,
+)
+pyside.QtGui = _stub(
+    "PySide6.QtGui",
+    QColor=_noop, QFont=_noop, QPaintEvent=object, QPainter=_noop, QPen=_noop,
+    QScreen=object,
+)
+pyside.QtSvg = _stub("PySide6.QtSvg", QSvgRenderer=QSvgRenderer)
 pyside.QtWidgets = _stub("PySide6.QtWidgets", QWidget=QWidget)
 
 class _SLLogger:
