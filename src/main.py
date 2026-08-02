@@ -32,7 +32,15 @@ from PySide6.QtWidgets import (
 from core import research_log as rlog
 from core.activation import ACTIVATION_REGISTRY
 from core.actuator import make_actuator
-from core.appearance import L2CSConsumerMixin, L2CSEstimator, L2CSWorker, WorkerState
+from core.appearance import (
+    FreshSampleConsumer,
+    build_appearance_vector,
+    L2CSConsumer,
+    L2CSEstimator,
+    L2CSWorker,
+    SmoothedStreamConsumer,
+    WorkerState,
+)
 from core.appearance import available as l2cs_available
 from core.calibration import (
     DEFAULT_STRATEGY_KEY,
@@ -78,7 +86,6 @@ VALIDATION_TARGETS: Final[list[NormalizedPoint]] = [
 ]
 
 
-# Lazily-constructed shared L2CS worker
 _l2cs_worker: L2CSWorker | None = None
 
 
@@ -93,33 +100,23 @@ def _get_l2cs_worker() -> L2CSWorker:
 
 def build_strategy_vector(
     strategy: CalibrationStrategy,
-    frame: np.ndarray,
     data: LandmarksData,
-    consumer: L2CSConsumerMixin | None = None,
+    consumer: L2CSConsumer | None = None,
 ) -> list[float] | None:
     """
     Assembles the feature vector based on the strategy's feature source.
 
     - Geometric: Returns the PC-EC vector (optionally pose-augmented).
-    - Appearance (L2CS): Returns the latest CNN (pitch, yaw) angles.
-
-      The `consumer` ensures each background inference is returned at most once.
+    - Appearance (L2CS): Returns CNN (pitch, yaw) angles as decided by the
+      `consumer` - one sample per inference while calibrating, a continuously
+      eased value while interacting (optionally pose-augmented).
     """
 
     if strategy.feature_source == FeatureSource.L2CS:
-        if data.face_bbox is None:
-            return None
-        worker = _get_l2cs_worker()
-        worker.submit(frame, data.face_bbox)
-        latest, seq = worker.result()
-        if latest is None:
-            return None
-        if consumer is not None:
-            if seq == consumer._l2cs_last_seq:
-                return None
-            consumer._l2cs_last_seq = seq
-        return [latest[0], latest[1]]
-    return build_feature_vector(data, use_head_pose=strategy.use_head_pose)
+        return build_appearance_vector(
+            _get_l2cs_worker(), data, consumer, strategy.use_head_pose
+        )
+    return build_feature_vector(data, strategy.use_head_pose)
 
 
 class CameraThread(QThread):
@@ -151,7 +148,7 @@ class Phase(Enum):
     VALIDATION = auto()
 
 
-class CalibrationOverlay(QWidget, L2CSConsumerMixin):
+class CalibrationOverlay(QWidget):
     """
     Frameless full-screen calibration surface.
 
@@ -198,13 +195,16 @@ class CalibrationOverlay(QWidget, L2CSConsumerMixin):
         self.pose_batch: list[tuple[float, float, float]] = []
         self.head_monitor: HeadPoseMonitor | None = None
 
+        # Independent observations only, so batch spread stays meaningful
+        self._l2cs: L2CSConsumer = FreshSampleConsumer()
+
     def start(self) -> None:
         self.setGeometry(self._screen.geometry())
         self.showFullScreen()
         self.setFocus()
 
-    def _build_vec(self, frame: np.ndarray, data: LandmarksData) -> list[float] | None:
-        return build_strategy_vector(self.strategy, frame, data, consumer=self)
+    def _build_vec(self, data: LandmarksData) -> list[float] | None:
+        return build_strategy_vector(self.strategy, data, consumer=self._l2cs)
 
     @Slot(np.ndarray, LandmarksData)
     def on_frame(self, frame: np.ndarray, data: LandmarksData) -> None:
@@ -217,7 +217,7 @@ class CalibrationOverlay(QWidget, L2CSConsumerMixin):
 
         if not self.collecting:
             return
-        vec = self._build_vec(frame, data)
+        vec = self._build_vec(data)
         if vec is None:
             return
         self.batch.append(vec)
@@ -235,7 +235,7 @@ class CalibrationOverlay(QWidget, L2CSConsumerMixin):
             return
         if elapsed < PURSUIT_LAG_S:
             return
-        vec = self._build_vec(frame, data)
+        vec = self._build_vec(data)
         if vec is None:
             return
         label = segment.position_at(elapsed - PURSUIT_LAG_S)
@@ -488,7 +488,7 @@ class CalibrationOverlay(QWidget, L2CSConsumerMixin):
         painter.end()
 
 
-class MainWindow(QMainWindow, L2CSConsumerMixin):
+class MainWindow(QMainWindow):
     def __init__(self, screen: QScreen) -> None:
         super().__init__()
         self.setWindowTitle("Vistea")
@@ -587,7 +587,10 @@ class MainWindow(QMainWindow, L2CSConsumerMixin):
         self.latest_gaze: NormalizedPoint | None = None
 
         self._l2cs_status_state: WorkerState | None = None
- 
+
+        # Interaction reads the CNN every frame, eased between inferences
+        self._l2cs_stream: L2CSConsumer = SmoothedStreamConsumer()
+
         self.camera_thread = CameraThread()
         self.camera_thread.frame_ready.connect(self.update_ui)
         self.camera_thread.start()
@@ -637,6 +640,7 @@ class MainWindow(QMainWindow, L2CSConsumerMixin):
 
         self.strategy = candidate
         self.gaze_filter.reset()
+        self._l2cs_stream.reset()
         self.latest_gaze = None
         self.head_monitor = None
         self._pose_ok = True
@@ -809,7 +813,7 @@ class MainWindow(QMainWindow, L2CSConsumerMixin):
             and self.strategy.is_calibrated()
             and data.gaze_valid
         ):
-            vec = build_strategy_vector(self.strategy, frame, data, consumer=self)
+            vec = build_strategy_vector(self.strategy, data, consumer=self._l2cs_stream)
             # Cursor paused while the head has drifted, and while a lid is in motion
             if vec is not None and pose_ok and data.lids_stable:
                 raw = self.strategy.predict(vec)

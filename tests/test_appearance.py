@@ -20,6 +20,9 @@ from core.appearance import (
     AnglesRadian,
     FaceBoundingBox,
     L2CSWorker,
+    bin_confidence,
+    FreshSampleConsumer,
+    SmoothedStreamConsumer,
     available,
     decode_angle,
 )
@@ -113,7 +116,7 @@ def test_decode_angle_one_hot_matches_manual() -> None:
     k = 60
     logits = [-1e9] * N_BINS
     logits[k] = 0.0  
-    expected_deg = k * BIN_WIDTH_DEG + OFFSET_DEG + BIN_WIDTH_DEG / 2.0
+    expected_deg = k * BIN_WIDTH_DEG + OFFSET_DEG
     assert math.isclose(decode_angle(logits), math.radians(expected_deg), abs_tol=1e-6)
 
 
@@ -121,9 +124,9 @@ def test_decode_angle_center_bin_near_zero() -> None:
     logits = [-1e9] * N_BINS
     logits[44] = 0.0
     logits[45] = 0.0
-    expected_deg = 44.5 * BIN_WIDTH_DEG + OFFSET_DEG + BIN_WIDTH_DEG / 2.0
-    assert math.isclose(expected_deg, 0.0, abs_tol=1e-9)
-    assert math.isclose(decode_angle(logits), 0.0, abs_tol=1e-6)
+    expected_deg = 44.5 * BIN_WIDTH_DEG + OFFSET_DEG
+    assert math.isclose(expected_deg, -2.0, abs_tol=1e-9)
+    assert math.isclose(decode_angle(logits), math.radians(expected_deg), abs_tol=1e-6)
 
 
 def test_decode_angle_softmax_weights_two_equal_bins() -> None:
@@ -132,7 +135,7 @@ def test_decode_angle_softmax_weights_two_equal_bins() -> None:
     logits[a] = 0.0
     logits[b] = 0.0
     mean_idx = (a + b) / 2.0
-    expected_deg = mean_idx * BIN_WIDTH_DEG + OFFSET_DEG + BIN_WIDTH_DEG / 2.0
+    expected_deg = mean_idx * BIN_WIDTH_DEG + OFFSET_DEG
     assert math.isclose(decode_angle(logits), math.radians(expected_deg), abs_tol=1e-6)
 
 
@@ -226,3 +229,95 @@ def test_worker_warmup_reports_failed_build() -> None:
     assert _wait_until(lambda: worker.state == "failed")
     assert worker.result() == (None, 0)
     worker.stop()
+
+
+def test_fresh_sample_consumer_yields_each_inference_once() -> None:
+    consumer = FreshSampleConsumer()
+
+    assert consumer.take((0.1, 0.2), 1, 0.0) == (0.1, 0.2)
+    assert consumer.take((0.1, 0.2), 1, 0.03) is None
+    assert consumer.take((0.1, 0.2), 1, 0.06) is None
+    assert consumer.take((0.3, 0.4), 2, 0.30) == (0.3, 0.4)
+
+
+def test_fresh_sample_consumer_skips_missing_inferences() -> None:
+    consumer = FreshSampleConsumer()
+    assert consumer.take(None, 0, 0.0) is None
+
+
+def test_smoothed_stream_consumer_returns_a_value_every_frame() -> None:
+    consumer = SmoothedStreamConsumer(time_constant_s=0.2)
+    consumer.take((0.0, 0.0), 1, 0.0)
+
+    values = [consumer.take((0.0, 0.0), 1, 0.03 * i) for i in range(1, 10)]
+    assert all(v is not None for v in values)
+
+
+def test_smoothed_stream_consumer_eases_toward_a_new_inference() -> None:
+    consumer = SmoothedStreamConsumer(time_constant_s=0.2)
+    consumer.take((0.0, 0.0), 1, 0.0)
+
+    step_targets = (1.0, -1.0)
+    first = consumer.take(step_targets, 2, 0.033)
+    assert first is not None
+
+    # A single frame must not jump the whole way
+    assert 0.0 < first[0] < 0.5
+    assert -0.5 < first[1] < 0.0
+
+    value = first
+    t = 0.033
+    for _ in range(60):
+        t += 0.033
+        value = consumer.take(step_targets, 2, t)
+        assert value is not None
+
+    assert math.isclose(value[0], 1.0, abs_tol=0.02)
+    assert math.isclose(value[1], -1.0, abs_tol=0.02)
+
+
+def test_smoothed_stream_consumer_reset_restarts_from_the_next_value() -> None:
+    consumer = SmoothedStreamConsumer(time_constant_s=0.2)
+    consumer.take((0.0, 0.0), 1, 0.0)
+    consumer.reset()
+
+    assert consumer.take((0.9, 0.9), 2, 0.033) == (0.9, 0.9)
+
+
+def test_both_consumers_satisfy_the_protocol() -> None:
+    for consumer in (FreshSampleConsumer(), SmoothedStreamConsumer()):
+        assert hasattr(consumer, "take") and hasattr(consumer, "reset")
+
+
+def test_stream_consumer_derives_its_time_constant_from_the_stream() -> None:
+    consumer = SmoothedStreamConsumer()
+    t = 0.0
+    seq = 1
+
+    # Inferences arriving every ~0.3 s, camera frames every ~0.033 s
+    for _ in range(6):
+        for i in range(9):
+            consumer.take((0.1, 0.2), seq, t)
+            t += 0.033
+        seq += 1
+
+    tau = consumer._tau()
+    assert SmoothedStreamConsumer.MIN_TAU_S <= tau <= SmoothedStreamConsumer.MAX_TAU_S
+    assert 0.05 < tau < 0.20
+
+
+def test_stream_consumer_honours_an_explicit_time_constant() -> None:
+    consumer = SmoothedStreamConsumer(time_constant_s=0.25)
+    consumer.take((0.0, 0.0), 1, 0.0)
+    assert consumer._tau() == 0.25
+
+
+def test_bin_confidence_is_one_for_a_certain_head() -> None:
+    logits = [-1e9] * N_BINS
+    logits[40] = 0.0
+    assert math.isclose(bin_confidence(logits), 1.0, abs_tol=1e-9)
+
+
+def test_bin_confidence_is_lowest_for_a_flat_head() -> None:
+    # A flat distribution means the crop is unlike the training data
+    assert math.isclose(bin_confidence([0.0] * N_BINS), 1.0 / N_BINS, abs_tol=1e-9)

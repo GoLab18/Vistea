@@ -244,8 +244,20 @@ class LandmarksData:
     right_iris_px: PixelCoord | None = None
     face_bbox: BoundingBox | None = None # Consumed by the appearance-based (CNN) feature source
 
+    # The preprocessed frame without the debug overlay, for consumers that read
+    # pixels rather than landmarks.
+    frame_bgr: np.ndarray | None = None
+
     blendshapes: FaceBlendshapes | None = None
     timestamp_ms: int = 0
+
+
+def pose_terms(data: LandmarksData) -> list[float] | None:
+    """The three head-orientation terms appended to a pose-augmented vector."""
+
+    if data.head_pose is None:
+        return None
+    return [data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll]
 
 
 def build_feature_vector(data: LandmarksData, use_head_pose: bool = False) -> list[float] | None:
@@ -266,10 +278,8 @@ def build_feature_vector(data: LandmarksData, use_head_pose: bool = False) -> li
     if not use_head_pose:
         return vec
 
-    if data.head_pose is None:
-        return None
-
-    return vec + [data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll]
+    pose = pose_terms(data)
+    return None if pose is None else vec + pose
 
 
 def _eye_relative(
@@ -339,7 +349,7 @@ class GazeEstimator:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
         detection_result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
-        data = LandmarksData(timestamp_ms=timestamp_ms)
+        data = LandmarksData(timestamp_ms=timestamp_ms, frame_bgr=frame)
         annotated = np.copy(frame)
 
         if not detection_result.face_landmarks:
@@ -358,12 +368,13 @@ class GazeEstimator:
         h, w, _ = frame.shape
         aspect = w / h
 
-        # Raw pixel bounding box for appearance-based CNN cropping
+        # Pixel bounding box for appearance-based CNN cropping - landmarks
+        # may sit slightly outside the image.
         xs = [p.x for p in lm]
         ys = [p.y for p in lm]
         data.face_bbox = (
-            int(min(xs) * w), int(min(ys) * h),
-            int(max(xs) * w), int(max(ys) * h),
+            max(0, int(min(xs) * w)), max(0, int(min(ys) * h)),
+            min(w, int(max(xs) * w)), min(h, int(max(ys) * h)),
         )
 
         def pt(idx: int) -> np.ndarray:
