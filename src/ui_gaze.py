@@ -1394,10 +1394,7 @@ class GazeInteractionController(QObject):
         self.overlay.recal_target_progress = status.progress
         self.overlay.recal_message = status.message
         self.overlay.recal_armed = status.phase is not RecalPhase.PROMPT
-        self.overlay.cursor_px = (
-            self._geo.x() + int(gx * self._geo.width()),
-            self._geo.y() + int(gy * self._geo.height()),
-        ) if gx is not None else None
+        self.overlay.cursor_px = None
         self.overlay.fixating = fix.fixating
         self.overlay.progress = 0.0
         self.overlay.update()
