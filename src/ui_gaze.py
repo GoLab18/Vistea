@@ -779,7 +779,6 @@ class GazeOverlay(QWidget):
         self.cursor_px: tuple[int, int] | None = None
         self.fixating = False
         self.progress = 0.0
-        self.mode_name = ""
         self.scroll_zones = False
 
         self.scroll_active: ScrollDirection = SCROLL_NONE
@@ -820,15 +819,11 @@ class GazeOverlay(QWidget):
                 edge_col.setAlpha(200 if active else 90)
                 painter.fillRect(0, 0 if sign == SCROLL_UP else h - 3, w, 3, edge_col)
 
-        painter.setPen(QColor(255, 255, 255, 200))
-        painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        painter.drawText(QRect(0, 6, w, 30), Qt.AlignmentFlag.AlignHCenter, f"GAZE MODE - {self.mode_name}")
-
         self._prune_toasts()
         toast_font = QFont("Arial", 13)
         painter.setFont(toast_font)
         metrics = painter.fontMetrics()
-        toast_y = 40
+        toast_y = 12
         border_by_level = {
             "info": ACCENT,
             "warning": QColor(230, 150, 40),
@@ -1233,7 +1228,6 @@ class GazeInteractionController(QObject):
             tile_meets_2x_error=(mean_error_px is None or tile_px >= 2 * mean_error_px),
             device_pixel_ratio=self._dpr
         )
-        self.overlay.mode_name = self.mode.name
         self.overlay.show()
         self.mode.enter()
 
@@ -1364,7 +1358,6 @@ class GazeInteractionController(QObject):
 
         self.mode = self._modes[action]
         self.mode.enter()
-        self.overlay.mode_name = self.mode.name
 
         if action is ModeAction.TO_KEYBOARD and self.keyboard.pinned:
             self._reserve_current_strip()
