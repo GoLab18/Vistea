@@ -15,7 +15,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final
 
+import numpy as np
+from sklearn.linear_model import Ridge
+
 from core.calibration import CalibrationStrategy, FeatureVector, NormalizedPoint
+
+type PoseTuple = tuple[float, float, float]  # (yaw, pitch, roll) in radians
 
 # Minimum tile floor regardless of measured accuracy
 TILE_FLOOR_PX: Final[int] = 80
@@ -160,13 +165,78 @@ class DriftCorrector:
         return DriftResult(len(train_frames), pre_error_norm, post_error_norm, mean_prediction)
 
 
+class PoseResidualCorrector:
+    """
+    Tries to cancel the systematic mapping error caused by slight head pose changes.
+
+    Uses a rolling window of recent activations to fit a tiny, separate Ridge
+    regression (Pose 3D -> 2D Shift), trying to prevent temporary posture changes 
+    from polluting the global calibration model.
+    """
+
+    # Caps poses so that the history is fresh
+    HISTORY_WINDOW: Final[int] = 60
+
+    MIN_OBSERVATIONS: Final[int] = 8
+    MAX_POSE_SHIFT: Final[float] = 0.12
+    RIDGE_ALPHA: Final[float] = 0.01
+
+    def __init__(self) -> None:
+        self._poses: deque[PoseTuple] = deque(maxlen=self.HISTORY_WINDOW)
+        self._residuals: deque[tuple[float, float]] = deque(maxlen=self.HISTORY_WINDOW)
+        self._model: Ridge | None = None
+
+    @property
+    def n_observations(self) -> int:
+        return len(self._poses)
+
+    @property
+    def is_active(self) -> bool:
+        return self._model is not None
+
+    def reset(self) -> None:
+        self._poses.clear()
+        self._residuals.clear()
+        self._model = None
+
+    def observe(self, pose: PoseTuple, gaze_residual: tuple[float, float]) -> bool:
+        """
+        Records the gaze error for a given head pose.
+        Returns True once the model is fitted.
+        """
+
+        self._poses.append(pose)
+        self._residuals.append(gaze_residual)
+
+        if len(self._poses) < self.MIN_OBSERVATIONS:
+            return False
+
+        model = Ridge(alpha=self.RIDGE_ALPHA)
+        model.fit(np.asarray(self._poses, dtype=float), np.asarray(self._residuals, dtype=float))
+        self._model = model
+
+        return True
+
+    def correct(self, point: NormalizedPoint, pose: PoseTuple | None) -> NormalizedPoint:
+        """Applies the pose-dependent shift to one predicted gaze point."""
+
+        if self._model is None or pose is None:
+            return point
+
+        shift = self._model.predict(np.asarray([pose], dtype=float))[0]
+        dx = float(np.clip(shift[0], -self.MAX_POSE_SHIFT, self.MAX_POSE_SHIFT))
+        dy = float(np.clip(shift[1], -self.MAX_POSE_SHIFT, self.MAX_POSE_SHIFT))
+
+        return NormalizedPoint(point.x + dx, point.y + dy)
+
+
 class BiasRecalibration:
     """
     Single-point recalibration strategy.
     Gathers offset data from a single target to correct uniform drift without a full model refit.
     """
 
-    MIN_FRAMES = 10
+    MIN_FRAMES: Final[int] = 10
 
     def __init__(self) -> None:
         self._preds: list[NormalizedPoint] = []

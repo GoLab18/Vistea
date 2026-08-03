@@ -9,6 +9,7 @@ from core.drift import (
     TILE_FLOOR_PX,
     BiasRecalibration,
     DriftCorrector,
+    PoseResidualCorrector,
     RecalibrationSession,
     RecalPhase,
     min_tile_side_px,
@@ -276,3 +277,59 @@ def test_losing_the_gaze_for_too_long_rearms_and_drops_partial_samples() -> None
 
     assert status.phase is RecalPhase.ARMED
     assert session.n_frames == 0
+
+
+def _feed_pose_observations(corr: PoseResidualCorrector, n: int = 12) -> None:
+    for i in range(n):
+        yaw = -0.20 + 0.40 * i / (n - 1)
+        corr.observe((yaw, 0.0, 0.0), (0.5 * yaw, 0.0))
+
+
+def test_ignores_observations_until_minimum_count_is_reached() -> None:
+    corr = PoseResidualCorrector()
+    point = NormalizedPoint(0.4, 0.6)
+
+    for _ in range(PoseResidualCorrector.MIN_OBSERVATIONS - 1):
+        assert corr.observe((0.1, 0.0, 0.0), (0.05, 0.0)) is False
+        assert corr.correct(point, (0.1, 0.0, 0.0)) == point
+
+    assert corr.is_active is False
+
+
+def test_applies_directional_shift_based_on_learned_pose() -> None:
+    corr = PoseResidualCorrector()
+    _feed_pose_observations(corr)
+    assert corr.is_active
+
+    right = corr.correct(NormalizedPoint(0.5, 0.5), (0.2, 0.0, 0.0))
+    left = corr.correct(NormalizedPoint(0.5, 0.5), (-0.2, 0.0, 0.0))
+
+    assert right.x > 0.5  # Shifted one way
+    assert left.x < 0.5   # Shifted the other way at the opposite pose
+
+    assert math.isclose(right.x - 0.5, 0.5 * 0.2, abs_tol=0.02)
+
+
+def test_neutral_pose_yields_zero_correction() -> None:
+    corr = PoseResidualCorrector()
+    _feed_pose_observations(corr)
+
+    neutral_pose = (0.0, 0.0, 0.0)
+    at_rest = corr.correct(NormalizedPoint(0.5, 0.5), neutral_pose)
+    assert math.isclose(at_rest.x, 0.5, abs_tol=0.02)
+    assert math.isclose(at_rest.y, 0.5, abs_tol=0.02)
+
+
+def test_returns_unmodified_point_when_pose_is_none() -> None:
+    corr = PoseResidualCorrector()
+    _feed_pose_observations(corr)
+    point = NormalizedPoint(0.3, 0.7)
+    assert corr.correct(point, None) == point
+
+
+def test_clamps_correction_to_max_pose_shift_limit() -> None:
+    corr = PoseResidualCorrector()
+    _feed_pose_observations(corr)
+
+    far = corr.correct(NormalizedPoint(0.5, 0.5), (5.0, 0.0, 0.0))
+    assert abs(far.x - 0.5) <= PoseResidualCorrector.MAX_POSE_SHIFT + 1e-9

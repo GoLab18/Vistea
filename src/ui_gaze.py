@@ -22,6 +22,7 @@ from core.actuator import SystemActuator
 from core.calibration import CalibrationStrategy, NormalizedPoint
 from core.drift import (
     DriftCorrector,
+    PoseResidualCorrector,
     RecalibrationSession,
     RecalPhase,
     min_tile_side_px,
@@ -1242,6 +1243,9 @@ class GazeInteractionController(QObject):
         self._recal: RecalibrationSession | None = None
         self._gaze_bias: NormalizedPoint | None = None
 
+        self.pose_residual = PoseResidualCorrector()
+        self._latest_pose: tuple[float, float, float] | None = None
+
         # Head-pose-drift suggestion: nudge the user toward RECAL once per
         # session after repeated drift transitions.
         self._pose_drift_count = 0
@@ -1367,6 +1371,30 @@ class GazeInteractionController(QObject):
 
         rlog.event("mode_switched", mode=self.mode.name)
 
+    def _observe_pose_residual(
+        self, tile_id: str, actual_gaze_pos: tuple[float, float] | None
+    ) -> None:
+        """Records the gaze error for a given head pose upon a successful tile activation."""
+
+        if actual_gaze_pos is None or self._latest_pose is None:
+            return
+        center = self.mode.board.tile_center_norm(tile_id)
+        if center is None:
+            return
+
+        residual = (center.x - actual_gaze_pos[0], center.y - actual_gaze_pos[1])
+        if not self.pose_residual.observe(self._latest_pose, residual):
+            return
+
+        rlog.event(
+            "pose_residual_fit",
+            tile=tile_id,
+            n_observations=self.pose_residual.n_observations,
+            residual_x=round(residual[0], 5),
+            residual_y=round(residual[1], 5),
+            level=logging.DEBUG,
+        )
+
     def _apply_bias(self, gaze: NormalizedPoint | None) -> NormalizedPoint | None:
         """Adds the stored bias offset to a gaze point shifting everything with it."""
 
@@ -1419,7 +1447,13 @@ class GazeInteractionController(QObject):
                 vec: list[float] | None) -> None:
         t = time.monotonic()
 
+        self._latest_pose = (
+            (data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll)
+            if data.head_pose is not None else None
+        )
+
         gaze = self._apply_bias(gaze)
+        gaze = self.pose_residual.correct(gaze, self._latest_pose) if gaze else gaze
 
         # While recalibrating, normal activation is suspended
         if self._recal is not None:
@@ -1463,6 +1497,7 @@ class GazeInteractionController(QObject):
                 kind=event.kind.value,
                 mode=self.mode.name
             )
+            self._observe_pose_residual(event.target_id, probe)
             action = self.mode.on_activation(event.target_id)
             if action is ModeAction.EXIT:
                 self.stop()
