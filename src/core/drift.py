@@ -15,11 +15,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final
 
-from core.calibration import CalibrationStrategy, NormalizedPoint
+from core.calibration import CalibrationStrategy, FeatureVector, NormalizedPoint
 
-type FeatureVector = list[float]
-
-TILE_FLOOR_PX = 80 # ergonomic minimum regardless of measured accuracy
+# Minimum tile floor regardless of measured accuracy
+TILE_FLOOR_PX: Final[int] = 80
 
 
 def min_tile_side_px(mean_error_px: float | None, factor: float = 2.0) -> int:
@@ -30,17 +29,42 @@ def min_tile_side_px(mean_error_px: float | None, factor: float = 2.0) -> int:
     return max(TILE_FLOOR_PX, int(round(factor * mean_error_px)))
 
 
+@dataclass(frozen=True)
+class DriftResult:
+    """Outcome of one accepted self-labelled correction."""
+
+    n_samples: int
+    pre_error_norm: float
+    post_error_norm: float
+    mean_prediction: NormalizedPoint
+
+
 class DriftCorrector:
     """
-    Treats deliberate UI dwell activations as ground-truth labels.
-    Retrains the calibration model incrementally to fight mapping drift.
+    Refines the calibration model using UI dwell activations as ground-truth labels.
+
+    To avoid cementing user compensation (where the user looks away from the
+    target to counteract a biased cursor), this acts strictly as a local
+    refinement mechanism:
+    1. Batches are rejected if the model's prediction is already too far from
+       the tile center.
+    2. Scattered batches are rejected (wandering gaze).
+    3. Interaction samples are capped so they never outnumber the initial
+       calibration samples, preventing the model from overfitting to the
+       keyboard area.
     """
+
+    # How far from the tile center the model may already be for its label to
+    # count, as a fraction of the tile's half-extent.
+    TRUST_FRACTION: Final[float] = 0.6
+
+    MAX_PREDICTION_SPREAD: Final[float] = 0.04
 
     def __init__(
         self,
         strategy: CalibrationStrategy,
-        frames_per_activation: int = 8,
-        max_corrections: int = 40,
+        frames_per_activation: int = 4,
+        max_corrections: int = 25,
         buffer_size: int = 30,
     ) -> None:
         self.strategy = strategy
@@ -48,6 +72,7 @@ class DriftCorrector:
         self.max_corrections = max_corrections
         self._buffer: deque[FeatureVector] = deque(maxlen=buffer_size)
         self.corrections_applied = 0
+        self.rejected = 0
 
     def observe(self, vec: FeatureVector | None) -> None:
         """Buffers feature vectors continuously while the user dwells."""
@@ -55,23 +80,40 @@ class DriftCorrector:
         if vec is not None:
             self._buffer.append(vec)
 
-    def clear(self) -> None:
-        self._buffer.clear()
+    def _predictions(self, batch: list[FeatureVector]) -> list[NormalizedPoint]:
+        return [p for p in (self.strategy.predict(vec) for vec in batch) if p is not None]
+
+    @staticmethod
+    def _mean_point(points: list[NormalizedPoint]) -> NormalizedPoint:
+        n = len(points)
+        return NormalizedPoint(sum(p.x for p in points) / n, sum(p.y for p in points) / n)
+
+    @staticmethod
+    def _spread(points: list[NormalizedPoint]) -> float:
+        return max(
+            max(p.x for p in points) - min(p.x for p in points),
+            max(p.y for p in points) - min(p.y for p in points),
+        )
 
     def _batch_error_norm(self, batch: list[FeatureVector], target: NormalizedPoint) -> float:
-        """Mean distance (normalized units) between model predictions and target."""
+        """Mean distance in normalized units between model predictions and target."""
 
-        errs = []
-        for vec in batch:
-            pred = self.strategy.predict(vec)
-            if pred is not None:
-                errs.append(math.hypot(pred.x - target.x, pred.y - target.y))
+        errs = [
+            math.hypot(p.x - target.x, p.y - target.y) for p in self._predictions(batch)
+        ]
         return sum(errs) / len(errs) if errs else float("nan")
 
-    def on_activation(self, tile_center: NormalizedPoint) -> tuple[int, float, float] | None:
+    def on_activation(
+        self,
+        tile_center: NormalizedPoint,
+        tile_half_extent: tuple[float, float],
+    ) -> DriftResult | None:
         """
-        Labels the buffered frames with the activated tile center and triggers a model refit.
-        Returns: (n_samples, pre_error_norm, post_error_norm) or `None` when not retrained.
+        Label the buffered frames with the activated tile center and refit.
+
+        `tile_half_extent` is half the tile's width and height.
+        Returns None whenever the batch was refused, which is the
+        normal outcome for an ambiguous or unsteady activation.
         """
 
         if self.corrections_applied >= self.max_corrections:
@@ -80,20 +122,42 @@ class DriftCorrector:
             return None
 
         batch = list(self._buffer)[-self.frames_per_activation:]
-        if len(batch) < 3: 
-            return None # Too little signal to label safely
+        if len(batch) < self.frames_per_activation:
+            return None  # Too little signal
 
-        pre_error_norm = self._batch_error_norm(batch, tile_center)
+        predictions = self._predictions(batch)
+        if len(predictions) < self.frames_per_activation:
+            return None
 
-        self.strategy.add_samples(tile_center, batch)
+        if self._spread(predictions) > self.MAX_PREDICTION_SPREAD:
+            self.rejected += 1
+            self._buffer.clear()
+            return None
+
+        mean_prediction = self._mean_point(predictions)
+        trust_radius = self.TRUST_FRACTION * min(tile_half_extent)
+        offset = math.hypot(
+            mean_prediction.x - tile_center.x, mean_prediction.y - tile_center.y
+        )
+        if offset > trust_radius:
+            self.rejected += 1
+            self._buffer.clear()
+            return None
+
+        # Train-test split to measure true generalization
+        train_frames, test_frame_newest = batch[:-1], batch[-1:]
+
+        pre_error_norm = self._batch_error_norm(test_frame_newest, tile_center)
+
+        self.strategy.add_samples(tile_center, train_frames)
         self.strategy.train()
 
-        post_error_norm = self._batch_error_norm(batch, tile_center)
+        post_error_norm = self._batch_error_norm(test_frame_newest, tile_center)
 
         self.corrections_applied += 1
         self._buffer.clear()
 
-        return len(batch), pre_error_norm, post_error_norm
+        return DriftResult(len(train_frames), pre_error_norm, post_error_norm, mean_prediction)
 
 
 class BiasRecalibration:
@@ -215,7 +279,7 @@ class RecalibrationSession:
                 return RecalStatus(
                     self._phase,
                     min(1.0, elapsed / self.PROMPT_S),
-                    "Recalibration - look at the dot in the centre of the screen",
+                    "Recalibration - look at the dot in the center of the screen",
                 )
             self._phase = RecalPhase.ARMED
             self._t0 = t

@@ -299,6 +299,18 @@ class TileBoardWindow(QWidget):
                 return NormalizedPoint(c.x() / geo.width(), c.y() / geo.height())
         return None
 
+    def tile_half_extent_norm(self, tile_id: str) -> tuple[float, float] | None:
+        """Half the tile's width and height in normalized units."""
+
+        geo = self._screen.geometry()
+        for tile in self.tiles:
+            if tile.tile_id == tile_id:
+                return (
+                    tile.rect.width() / (2.0 * geo.width()),
+                    tile.rect.height() / (2.0 * geo.height()),
+                )
+        return None
+
     def set_highlight(self, tile_id: str | None, progress: float) -> None:
         if tile_id != self._highlight or abs(progress - self._progress) > 0.02:
             self._highlight, self._progress = tile_id, progress
@@ -948,23 +960,29 @@ class KeyboardMode:
         bar.show()
 
     def _apply_drift(self, tile_id: str) -> None:
-        # Drift correction before mutating layout: the dwell frames in the
-        # buffer are ground-truth labeled by this tile's center.
+        """Drift correction before mutating layout: the buffered dwell frames
+        are labelled by the tile's center, if the batch earns that label."""
+
         if self._drift is None:
             return
         center = self.board.tile_center_norm(tile_id)
-        if center is not None:
-            result = self._drift.on_activation(center)
-            if result is not None:
-                added, pre_error_norm, post_error_norm = result
-                rlog.event(
-                    "drift_correction",
-                    tile=tile_id,
-                    n_samples=added,
-                    total=self._drift.corrections_applied,
-                    pre_error_norm=round(pre_error_norm, 5),
-                    post_error_norm=round(post_error_norm, 5),
-                )
+        half_extent = self.board.tile_half_extent_norm(tile_id)
+        if center is None or half_extent is None:
+            return
+
+        result = self._drift.on_activation(center, half_extent)
+        if result is None:
+            return
+
+        rlog.event(
+            "drift_correction",
+            tile=tile_id,
+            n_samples=result.n_samples,
+            total=self._drift.corrections_applied,
+            rejected=self._drift.rejected,
+            pre_error_norm=round(result.pre_error_norm, 5),
+            post_error_norm=round(result.post_error_norm, 5),
+        )
 
     def on_activation(self, tile_id: str) -> ModeAction | None:
         board = self.board

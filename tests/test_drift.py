@@ -6,6 +6,7 @@ import math
 
 from core.calibration import NormalizedPoint, PolynomialRidgeCalibration, make_grid
 from core.drift import (
+    TILE_FLOOR_PX,
     BiasRecalibration,
     DriftCorrector,
     RecalibrationSession,
@@ -15,7 +16,6 @@ from core.drift import (
 
 
 def _calibrated_strategy() -> PolynomialRidgeCalibration:
-    """Generates a reliably trained mock strategy for testing."""
     s = PolynomialRidgeCalibration(grid=make_grid(3))
     for target in s.target_sequence():
         batch = [[target.x + 0.001 * k, target.y, target.x, target.y] for k in range(5)]
@@ -24,62 +24,87 @@ def _calibrated_strategy() -> PolynomialRidgeCalibration:
     return s
 
 
-def test_drift_correction_pulls_prediction_toward_tile() -> None:
+TILE_HALF = (0.023, 0.040)
+
+
+def test_drift_correction_refines_when_the_model_already_agrees() -> None:
     s = _calibrated_strategy()
     tile = NormalizedPoint(0.25, 0.75)
 
-    # Simulate drift: features that should map to the tile now predict elsewhere.
-    drifted_vec = [tile.x + 0.06, tile.y, tile.x + 0.06, tile.y]
+    drifted_vec = [tile.x + 0.012, tile.y, tile.x + 0.012, tile.y]
     before = s.predict(drifted_vec)
     assert before is not None
     err_before = math.hypot(before.x - tile.x, before.y - tile.y)
 
-    corr = DriftCorrector(s, frames_per_activation=8)
-    for _ in range(8):
+    corr = DriftCorrector(s, frames_per_activation=4)
+    for _ in range(4):
         corr.observe(drifted_vec)
 
-    result = corr.on_activation(tile)
+    result = corr.on_activation(tile, TILE_HALF)
     assert result is not None
-
-    added, pre_error_norm, post_error_norm = result
-    assert added == 8
+    assert result.n_samples == 3  # One frame held out of the fit
 
     after = s.predict(drifted_vec)
     assert after is not None
-    err_after = math.hypot(after.x - tile.x, after.y - tile.y)
+    assert math.hypot(after.x - tile.x, after.y - tile.y) < err_before
 
-    # Model must move toward the labeled truth
-    assert err_after < err_before 
 
-    # Batch error against the tile center must not grow after the refit
-    assert post_error_norm <= pre_error_norm
+def test_large_discrepancy_is_refused_as_ambiguous() -> None:
+    s = _calibrated_strategy()
+    tile = NormalizedPoint(0.25, 0.75)
+    far_vec = [tile.x + 0.20, tile.y + 0.20, tile.x + 0.20, tile.y + 0.20]
+
+    corr = DriftCorrector(s, frames_per_activation=4)
+    for _ in range(4):
+        corr.observe(far_vec)
+
+    assert corr.on_activation(tile, TILE_HALF) is None
+    assert corr.rejected == 1
+    assert corr.corrections_applied == 0
+
+
+def test_scattered_batch_is_refused() -> None:
+    s = _calibrated_strategy()
+    tile = NormalizedPoint(0.5, 0.5)
+
+    corr = DriftCorrector(s, frames_per_activation=4)
+    for k in range(4):
+        corr.observe([0.5 + 0.05 * k, 0.5, 0.5 + 0.05 * k, 0.5])
+
+    assert corr.on_activation(tile, TILE_HALF) is None
+    assert corr.rejected == 1
+
+
+def test_interaction_samples_cannot_outnumber_calibration() -> None:
+    corr = DriftCorrector(_calibrated_strategy())
+    fitted_per_correction = corr.frames_per_activation - 1
+    assert corr.max_corrections * fitted_per_correction < 9 * 25
 
 
 def test_drift_correction_caps_and_guards() -> None:
     s = _calibrated_strategy()
-    corr = DriftCorrector(s, frames_per_activation=8, max_corrections=2)
+    tile = NormalizedPoint(0.5, 0.5)
+    corr = DriftCorrector(s, frames_per_activation=4, max_corrections=2)
     vec = [0.5, 0.5, 0.5, 0.5]
 
     for _ in range(2):
         corr.observe(vec)
 
-    # <3 frames: refuse
-    assert corr.on_activation(NormalizedPoint(0.5, 0.5)) is None 
+    assert corr.on_activation(tile, TILE_HALF) is None
 
     for _ in range(3):
-        for _ in range(8):
+        for _ in range(4):
             corr.observe(vec)
-        corr.on_activation(NormalizedPoint(0.5, 0.5))
+        corr.on_activation(tile, TILE_HALF)
 
-    # Ensure it's capped at max_corrections limit
     assert corr.corrections_applied == 2
 
 
 def test_tile_size_from_measured_error_with_floor() -> None:
-    assert min_tile_side_px(85.0) == 170  # 2 x measured error
-    assert min_tile_side_px(20.0) == 80   # ergonomic floor
-    assert min_tile_side_px(None) == 80
-    assert min_tile_side_px(float("nan")) == 80
+    assert min_tile_side_px(85.0) == 170  # 2x measured error
+    assert min_tile_side_px(20.0) == TILE_FLOOR_PX
+    assert min_tile_side_px(None) == TILE_FLOOR_PX
+    assert min_tile_side_px(float("nan")) == TILE_FLOOR_PX
 
 
 def test_bias_recalibration_requires_min_frames() -> None:
