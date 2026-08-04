@@ -1402,9 +1402,17 @@ class GazeInteractionController(QObject):
 
         if gaze is None or self._gaze_bias is None:
             return gaze
+
+        return NormalizedPoint(gaze.x + self._gaze_bias.x, gaze.y + self._gaze_bias.y)
+
+    @staticmethod
+    def _clamp_to_screen(gaze: NormalizedPoint | None) -> NormalizedPoint | None:
+        if gaze is None:
+            return None
+
         return NormalizedPoint(
-            min(1.0, max(0.0, gaze.x + self._gaze_bias.x)),
-            min(1.0, max(0.0, gaze.y + self._gaze_bias.y)),
+            min(1.0, max(0.0, gaze.x)),
+            min(1.0, max(0.0, gaze.y)),
         )
 
     def _run_recalibration(self, gaze: NormalizedPoint | None, t: float) -> None:
@@ -1457,17 +1465,18 @@ class GazeInteractionController(QObject):
         gaze = self._apply_bias(gaze)
         gaze = self.pose_residual.correct(gaze, self._latest_pose) if gaze else gaze
 
-        # While recalibrating, normal activation is suspended
+        # Recalibration requires the uncapped point, so the clamping happens only after it
         if self._recal is not None:
             self._run_recalibration(gaze, t)
             return
+
+        gaze = self._clamp_to_screen(gaze)
 
         gx = gy = None
         if gaze is not None:
             gx, gy = gaze.x, gaze.y
         fix = self.fixation.update(gx, gy, t)
 
-        # Hit-test at the fixation centroid when available (stable), else gaze
         target: str | None = None
         px = py = None
         probe = fix.centroid if fix.fixating else (gx, gy) if gx is not None else None

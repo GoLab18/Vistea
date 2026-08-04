@@ -176,7 +176,7 @@ class CalibrationOverlay(QWidget):
         self.collecting = False
         self.collect_t0 = 0.0
         self.batch: list[list[float]] = []
-        self.validation_predictions: list[list[float]] = []
+        self.validation_predictions: list[list[float] | None] = []
 
         # Pursuit segment state
         self.pursuit_active = False
@@ -344,14 +344,17 @@ class CalibrationOverlay(QWidget):
             mean_error_deg=report.mean_error_deg,
             mean_error_percent=report.mean_error_percent,
             n_points=len(report.points),
+            n_refused=report.n_refused or None,
         )
         self.finished.emit(self.strategy, report)
         self.close()
 
-    def _median_prediction(self, batch: list[list[float]]) -> list[float]:
-        preds = [self.strategy.predict(vec) for vec in batch]
-        xs = sorted(p.x for p in preds if p is not None)
-        ys = sorted(p.y for p in preds if p is not None)
+    def _median_prediction(self, batch: list[list[float]]) -> list[float] | None:
+        preds = [p for p in (self.strategy.predict(vec) for vec in batch) if p is not None]
+        if not preds:
+            return None
+        xs = sorted(p.x for p in preds)
+        ys = sorted(p.y for p in preds)
         return [xs[len(xs) // 2], ys[len(ys) // 2]]
 
     def _build_report(self) -> ValidationReport:
@@ -363,6 +366,14 @@ class CalibrationOverlay(QWidget):
             screen_h_px=geo.height(),
         )
         for target, pred in zip(VALIDATION_TARGETS, self.validation_predictions):
+            if pred is None:
+                report.n_refused += 1
+                rlog.event(
+                    "validation_point_refused",
+                    point=[target.x, target.y],
+                    level=logging.WARNING
+                )
+                continue
             report.points.append(
                 compute_point_error(
                     target,
@@ -817,7 +828,9 @@ class MainWindow(QMainWindow):
             # Cursor paused while the head has drifted, and while a lid is in motion
             if vec is not None and pose_ok and data.lids_stable:
                 raw = self.strategy.predict(vec)
-                if raw is not None:
+                if raw is None:
+                    self.latest_gaze = None
+                else:
                     fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
                     self.latest_gaze = NormalizedPoint(fx, fy)
 
@@ -842,8 +855,8 @@ class MainWindow(QMainWindow):
             pen = QPen(QColor(255, 0, 0))
             pen.setWidth(4)
             painter.setPen(pen)
-            gx = int(self.latest_gaze.x * scaled.width())
-            gy = int(self.latest_gaze.y * scaled.height())
+            gx = int(min(1.0, max(0.0, self.latest_gaze.x)) * scaled.width())
+            gy = int(min(1.0, max(0.0, self.latest_gaze.y)) * scaled.height())
             radius = 12
             painter.drawEllipse(QPoint(gx, gy), radius, radius)
             painter.drawLine(gx - radius - 5, gy, gx + radius + 5, gy)

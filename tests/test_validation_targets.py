@@ -1,4 +1,4 @@
-"""Tests that the validation target set stays disjoint from every training grid."""
+"""Tests for the post-calibration validation pass."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from typing import Protocol
 
 import numpy as np
 
-from core.calibration import make_5point, make_grid
+from core.calibration import NormalizedPoint, make_5point, make_grid
+from core.evaluation import ValidationReport, compute_point_error
 from main import VALIDATION_TARGETS
 
 
@@ -50,3 +51,14 @@ def test_central_target_is_off_the_16pt_grid_axes() -> None:
     axes = set(np.round(np.linspace(0.1, 0.9, 4), 6))
     assert round(0.45, 6) not in axes
     assert round(0.55, 6) not in axes
+
+
+def test_report_counts_refused_points_instead_of_dropping_them() -> None:
+    report = ValidationReport(strategy_name="test", screen_w_px=1000, screen_h_px=1000)
+    report.points.append(
+        compute_point_error(NormalizedPoint(0.5, 0.5), NormalizedPoint(0.6, 0.5), 1000, 1000)
+    )
+    report.n_refused = 2
+
+    assert abs(report.mean_error_px - 100.0) < 1e-6  # Mean over what survived
+    assert "2 refused" in report.summary()

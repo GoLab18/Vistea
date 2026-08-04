@@ -35,6 +35,7 @@ class ValidationReport:
     screen_w_px: int
     screen_h_px: int
     points: list[PointError] = field(default_factory=list)
+    n_refused: int = 0
 
     @property
     def mean_error_px(self) -> float:
@@ -59,9 +60,11 @@ class ValidationReport:
     def summary(self) -> str:
         deg = self.mean_error_deg
         deg_txt = f", {deg:.2f} deg" if deg is not None else ""
+        refused_txt = f", {self.n_refused} refused" if self.n_refused else ""
         return (
             f"[{self.strategy_name}] mean accuracy: {self.mean_error_px:.0f} px "
-            f"({self.mean_error_percent:.1f}% of diagonal{deg_txt}) over {len(self.points)} points"
+            f"({self.mean_error_percent:.1f}% of diagonal{deg_txt}) "
+            f"over {len(self.points)} points{refused_txt}"
         )
 
 
@@ -75,7 +78,7 @@ def compute_point_error(
     viewing_distance_cm: float = DEFAULT_VIEWING_DISTANCE_CM,
 ) -> PointError:
     """
-    Computes spatial distance (magnitude) between a target and the model's prediction.
+    Computes spatial distance between a target and the model's prediction.
     Reduces the 2D error vector to a 1D scalar for aggregate reporting.
     """
 

@@ -8,11 +8,14 @@ from core.calibration import (
     PURSUIT_LAG_S,
     FeatureSource,
     HybridCalibration,
+    PREDICTION_MARGIN,
     NormalizedPoint,
+    PolynomialRidgeCalibration,
     Segment,
     SegmentKind,
     SmoothPursuitCalibration,
     STRATEGY_REGISTRY,
+    _as_prediction,
     make_grid,
 )
 
@@ -39,7 +42,7 @@ def test_registry_has_l2cs_linear_variant() -> None:
     assert s.feature_source == FeatureSource.L2CS
     assert s.name == "l2cs_linear"
 
-    assert s.samples_per_point == 12
+    assert s.samples_per_point == 20
     assert s.spread_threshold == 0.08
 
     poly = s._model.steps[0][1]
@@ -52,7 +55,7 @@ def test_all_non_l2cs_strategies_use_pcec() -> None:
 
     for key, factory in STRATEGY_REGISTRY.items():
         s = factory()
-        if key == "L2CS-Net + linear (CNN)":
+        if s.feature_source is FeatureSource.L2CS:
             continue
         assert s.feature_source == FeatureSource.PCEC, key
         assert s.samples_per_point == 25, key
@@ -128,3 +131,20 @@ def test_hybrid_combines_static_and_pursuit() -> None:
     s.train()
     pred = s.predict(fake(NormalizedPoint(0.5, 0.5)))
     assert pred is not None and math.hypot(pred.x - 0.5, pred.y - 0.5) < 0.02
+
+
+def test_wild_extrapolation_is_refused_not_saturated() -> None:
+    s = PolynomialRidgeCalibration(grid=make_grid(3), degree=1)
+    for value in (0.0, 0.5, 1.0):
+        s.add_samples(NormalizedPoint(value, value), [[value, value, value, value]])
+    s.train()
+
+    assert s.predict([500.0, 500.0, 500.0, 500.0]) is None
+
+
+def test_the_gate_admits_the_margin_and_refuses_non_finite_output() -> None:
+    assert _as_prediction(1.0 + PREDICTION_MARGIN, -PREDICTION_MARGIN) is not None
+    assert _as_prediction(1.0 + PREDICTION_MARGIN + 0.01, 0.5) is None
+
+    assert _as_prediction(float("inf"), 0.5) is None
+    assert _as_prediction(0.5, float("nan")) is None

@@ -34,11 +34,23 @@ _UNSET: Final = object()
 # Used to temporally align captured frames with the correct trajectory position.
 PURSUIT_LAG_S: Final[float] = 0.150
 
+# How far outside the screen a prediction may land and still count as one
+PREDICTION_MARGIN: Final[float] = 0.5
+
 
 @dataclass(frozen=True)
 class NormalizedPoint:
     x: float
     y: float
+
+
+def _as_prediction(x: float, y: float) -> NormalizedPoint | None:
+    """Accepts a model output as a gaze estimate, or refuses it."""
+
+    lo, hi = -PREDICTION_MARGIN, 1.0 + PREDICTION_MARGIN
+    if lo <= x <= hi and lo <= y <= hi:
+        return NormalizedPoint(x, y)
+    return None
 
 
 class SegmentKind(Enum):
@@ -157,7 +169,8 @@ class CalibrationStrategy(Protocol):
         ...
 
     def predict(self, features: FeatureVector) -> NormalizedPoint | None:
-        """Maps a single feature vector to a normalized screen coordinate."""
+        """Maps a single feature vector to a normalized screen coordinate,
+        or returns None when there is no usable estimate."""
         ...
 
     def reset(self) -> None:
@@ -219,13 +232,15 @@ class _RidgeMixin:
         return self._trained
 
     def predict(self, features: FeatureVector) -> NormalizedPoint | None:
+        """
+        Predicts gaze with the given features. Returns None when the model is untrained,
+        and when it extrapolates past the prediction margin.
+        """
+
         if not self._trained:
             return None
         pred = self._model.predict(np.asarray(features, dtype=float).reshape(1, -1))[0]
-        return NormalizedPoint(
-            float(np.clip(pred[0], 0.0, 1.0)),
-            float(np.clip(pred[1], 0.0, 1.0)),
-        )
+        return _as_prediction(float(pred[0]), float(pred[1]))
 
     def reset(self) -> None:
         self._store.clear()
@@ -327,10 +342,7 @@ class HomographyCalibration:
             return None
         pt = np.array([[self._avg_eye(features)]], dtype=np.float32)
         mapped = cv2.perspectiveTransform(pt, self._h)[0][0]
-        return NormalizedPoint(
-            float(np.clip(mapped[0], 0.0, 1.0)),
-            float(np.clip(mapped[1], 0.0, 1.0)),
-        )
+        return _as_prediction(float(mapped[0]), float(mapped[1]))
 
     def reset(self) -> None:
         self._per_target.clear()
