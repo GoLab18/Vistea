@@ -28,7 +28,14 @@ from core.drift import (
     min_tile_side_px,
 )
 from core.fixation import IDTFixationDetector
-from core.gestures import SCROLL_DOWN, SCROLL_NONE, SCROLL_UP, EdgeScrollDetector, ScrollDirection
+from core.gestures import (
+    SCROLL_DOWN,
+    SCROLL_NONE,
+    SCROLL_UP,
+    EdgeScrollDetector,
+    ScrollDirection,
+    zone_from_error,
+)
 from core.hotkeys import HotkeyProfile, NavAction, load_profile
 from core.hotkeys import send as send_hotkey
 from core.suggestions import Suggestion, SuggestionEngine
@@ -1202,8 +1209,10 @@ class GazeInteractionController(QObject):
         self.fixation = IDTFixationDetector()
         self.drift = DriftCorrector(strategy)
         self.keyboard = KeyboardWindow(screen, tile_px)
-        self.edge = EdgeScrollDetector()
-        self.overlay.scroll_zone_frac = self.edge.zone
+        self.edge = EdgeScrollDetector(
+            zone_height_frac=zone_from_error(mean_error_px, self._geo.height())
+        )
+        self.overlay.scroll_zone_frac = self.edge.zone_height_frac
         self.actuator = actuator
         self.bar = BrowserBar(screen, tile_px)
         self.hotkeys = load_profile()
@@ -1508,7 +1517,8 @@ class GazeInteractionController(QObject):
             was_active = self.edge.active
             # A tile drawn inside a band belongs to the board, not the gesture
             over_widget = target is not None and target != SCREEN_CLICK
-            ticks = self.edge.update(gy, t, suppressed=over_widget)
+            band_y = probe[1] if probe is not None else None
+            ticks = self.edge.update(band_y, t, suppressed=over_widget)
             if ticks and gx is not None and gy is not None:
                 # The OS scroll wheel acts on whatever is under the real
                 # cursor, so move it under the current gaze point first.
