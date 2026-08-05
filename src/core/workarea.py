@@ -11,11 +11,19 @@ import logging
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Final, Literal, Protocol, assert_never, runtime_checkable
+from enum import Enum
+from typing import Final, Protocol, assert_never, runtime_checkable
 
 from core import research_log as rlog
 
-type DockEdge = Literal["top", "bottom", "left", "right"]
+
+class DockSide(str, Enum):
+    """Which screen edge something sits against."""
+
+    TOP = "top"
+    BOTTOM = "bottom"
+    LEFT = "left"
+    RIGHT = "right"
 
 
 @runtime_checkable
@@ -23,7 +31,7 @@ class WorkAreaReservation(Protocol):
     name: str
     active: bool
 
-    def reserve(self, edge: DockEdge, rect: tuple[int, int, int, int]) -> bool:
+    def reserve(self, edge: DockSide, rect: tuple[int, int, int, int]) -> bool:
         """Reserve a strip of the desktop along the `edge`.
         `rect` is the strip in physical pixels (x, y, w, h).
         Returns True on success."""
@@ -44,7 +52,7 @@ class NullReservation:
         self.calls: list[tuple] = []
         self.active: bool = False
 
-    def reserve(self, edge: DockEdge, rect: tuple[int, int, int, int]) -> bool:
+    def reserve(self, edge: DockSide, rect: tuple[int, int, int, int]) -> bool:
         self.calls.append(("reserve", edge, rect))
         self.active = True
         return True
@@ -65,11 +73,11 @@ _ABE_TOP: Final[int] = 1
 _ABE_RIGHT: Final[int] = 2
 _ABE_BOTTOM: Final[int] = 3
 
-_EDGE_TO_ABE: Final[dict[DockEdge, int]] = {
-    "left": _ABE_LEFT,
-    "top": _ABE_TOP,
-    "right": _ABE_RIGHT,
-    "bottom": _ABE_BOTTOM,
+_EDGE_TO_ABE: Final[dict[DockSide, int]] = {
+    DockSide.LEFT: _ABE_LEFT,
+    DockSide.TOP: _ABE_TOP,
+    DockSide.RIGHT: _ABE_RIGHT,
+    DockSide.BOTTOM: _ABE_BOTTOM,
 }
 
 
@@ -120,7 +128,7 @@ class WindowsAppBarReservation:
         self.active: bool = False
         self._shell = ctypes.windll.shell32
 
-    def reserve(self, edge: DockEdge, rect: tuple[int, int, int, int]) -> bool:
+    def reserve(self, edge: DockSide, rect: tuple[int, int, int, int]) -> bool:
         abe = _EDGE_TO_ABE.get(edge, _ABE_BOTTOM)
         try:
             if not self._registered:
@@ -165,19 +173,19 @@ _PROP_MODE_REPLACE: Final[int] = 0
 _PROP_FORMAT_32: Final[int] = 32
 
 
-def strut_values(edge: DockEdge, rect: tuple[int, int, int, int]) -> tuple[int, ...]:
+def strut_values(edge: DockSide, rect: tuple[int, int, int, int]) -> tuple[int, ...]:
     """Build the twelve cardinals of `_NET_WM_STRUT_PARTIAL`."""
 
     x, y, w, h = rect
 
     match edge:
-        case "left":
+        case DockSide.LEFT:
             return (w, 0, 0, 0, y, y + h - 1, 0, 0, 0, 0, 0, 0)
-        case "right":
+        case DockSide.RIGHT:
             return (0, w, 0, 0, 0, 0, y, y + h - 1, 0, 0, 0, 0)
-        case "top":
+        case DockSide.TOP:
             return (0, 0, h, 0, 0, 0, 0, 0, x, x + w - 1, 0, 0)
-        case "bottom":
+        case DockSide.BOTTOM:
             return (0, 0, 0, h, 0, 0, 0, 0, 0, 0, x, x + w - 1)
         case _:
             assert_never(edge)
@@ -240,7 +248,7 @@ class X11StrutReservation:
             len(values),
         )
 
-    def reserve(self, edge: DockEdge, rect: tuple[int, int, int, int]) -> bool:
+    def reserve(self, edge: DockSide, rect: tuple[int, int, int, int]) -> bool:
         values = strut_values(edge, rect)
         try:
             self._set_cardinals("_NET_WM_STRUT_PARTIAL", values)

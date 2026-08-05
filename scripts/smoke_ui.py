@@ -128,8 +128,8 @@ for t in kb.tiles:
 
 q = next(t for t in kb.tiles if t.tile_id == f"{KEY_PREFIX}q")
 c = q.rect.center()
-assert kb.hit_test(c.x(), c.y()) == f"{KEY_PREFIX}q"
-assert kb.hit_test(5, 5) is None
+assert kb.tile_hit_test(c.x(), c.y()) == f"{KEY_PREFIX}q"
+assert kb.tile_hit_test(5, 5) is None
 cn = kb.tile_center_norm(f"{KEY_PREFIX}q")
 assert cn is not None and 0 < cn.x < 1 and 0 < cn.y < 1
 
@@ -178,9 +178,9 @@ kb.resize_step(+4 if False else +1)
 
 kb.set_locked(True)
 sp = next(t for t in kb.tiles if t.tile_id == Ctl.SPACE).rect.center()
-assert kb.hit_test(sp.x(), sp.y()) is None 
+assert kb.tile_hit_test(sp.x(), sp.y()) is None 
 uc = kb._unlock_tile.rect.center()
-assert kb.hit_test(uc.x(), uc.y()) == Ctl.UNLOCK
+assert kb.tile_hit_test(uc.x(), uc.y()) == Ctl.UNLOCK
 assert kb.tile_center_norm(Ctl.UNLOCK) is not None
 
 act = NullActuator()

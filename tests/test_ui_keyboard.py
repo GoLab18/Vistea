@@ -186,7 +186,7 @@ def test_shrinking_stays_above_abs_min_and_flags_floor_unmet(kb: KeyboardWindow)
         assert min(t.rect.width(), t.rect.height()) >= kb.TILE_ABS_MIN
     smallest = min(min(t.rect.width(), t.rect.height()) for t in kb.tiles)
     if smallest < kb.min_tile_px:
-        assert kb._floor_unmet is True
+        assert kb.floor_unmet is True
 
 
 def test_scale_responsive_even_with_huge_accuracy_floor() -> None:
@@ -213,18 +213,18 @@ def test_opacity_step_clamps_to_bounds(kb: KeyboardWindow) -> None:
 
 def test_lock_restricts_hit_test_to_unlock_tile(kb: KeyboardWindow) -> None:
     sp = next(t for t in kb.tiles if t.tile_id == Ctl.SPACE).rect.center()
-    assert kb.hit_test(sp.x(), sp.y()) == Ctl.SPACE
+    assert kb.tile_hit_test(sp.x(), sp.y()) == Ctl.SPACE
     kb.set_locked(True)
-    assert kb.hit_test(sp.x(), sp.y()) is None
+    assert kb.tile_hit_test(sp.x(), sp.y()) is None
     uc = kb._unlock_tile.rect.center()
-    assert kb.hit_test(uc.x(), uc.y()) == Ctl.UNLOCK
+    assert kb.tile_hit_test(uc.x(), uc.y()) == Ctl.UNLOCK
 
 
 def test_unlock_restores_normal_hit_test(kb: KeyboardWindow) -> None:
     kb.set_locked(True)
     kb.set_locked(False)
     sp = next(t for t in kb.tiles if t.tile_id == Ctl.SPACE).rect.center()
-    assert kb.hit_test(sp.x(), sp.y()) == Ctl.SPACE
+    assert kb.tile_hit_test(sp.x(), sp.y()) == Ctl.SPACE
 
 
 @pytest.fixture
@@ -261,14 +261,14 @@ def test_delete_word_sends_ctrl_backspace_hotkey(kb: KeyboardWindow, mode: Keybo
 
 
 def test_enter_commits_preview_and_presses_enter(kb: KeyboardWindow, mode: KeyboardMode) -> None:
-    got: list[str] = []
-    kb.committed.connect(got.append)
     mode.on_activation(f"{KEY_PREFIX}a")
     mode.on_activation(Ctl.SPACE)
+    assert kb.buffer == "a "
+
     ret = mode.on_activation(Ctl.ENTER)
+
     assert ret is None
-    assert kb.buffer == "" 
-    assert got == ["a "] 
+    assert kb.buffer == ""
     assert ("press_key", "enter") in mode._actuator.calls
 
 
@@ -444,6 +444,24 @@ def test_suggestion_bar_hidden_off_letters_page(kb: KeyboardWindow, sugg_mode: K
     assert not sugg_mode.suggestions_board.isVisible()
 
 
+def test_lock_also_covers_the_suggestion_strip(kb: KeyboardWindow, sugg_mode: KeyboardMode) -> None:
+    kb.type_preview("the")
+    sugg_mode._refresh_suggestions()
+    bar = sugg_mode.suggestions_board
+    assert bar is not None and bar.isVisible()
+
+    sugg_mode.on_activation(Ctl.LOCK)
+    assert not bar.isVisible()
+
+    act = sugg_mode._actuator
+    act.calls.clear()
+    sugg_mode.on_activation(f"{SUGG_PREFIX}0")
+    assert act.calls == [], "a locked keyboard must not type through its suggestions"
+
+    sugg_mode.on_activation(Ctl.UNLOCK)
+    assert bar.isVisible()
+
+
 def test_suggestion_tiles_are_hit_testable(kb: KeyboardWindow, sugg_mode: KeyboardMode) -> None:
     kb.type_preview("the")
     sugg_mode._refresh_suggestions()
@@ -452,7 +470,7 @@ def test_suggestion_tiles_are_hit_testable(kb: KeyboardWindow, sugg_mode: Keyboa
     assert bar is not None
     tile = next(t for t in bar.tiles if t.tile_id == f"{SUGG_PREFIX}0")
     c = tile.rect.center()
-    assert bar.hit_test(c.x(), c.y()) == f"{SUGG_PREFIX}0"
+    assert bar.tile_hit_test(c.x(), c.y()) == f"{SUGG_PREFIX}0"
 
 
 def test_reserved_suggestion_row_keeps_board_plus_strip_on_screen(kb: KeyboardWindow) -> None:
@@ -460,7 +478,7 @@ def test_reserved_suggestion_row_keeps_board_plus_strip_on_screen(kb: KeyboardWi
     kb.cycle_language()
     assert kb.layout.code == "PL"
     kb.reserve_suggestion_row = True
-    kb._layout_tiles()
+    kb.relayout()
     tile = next(t for t in kb.tiles if t.tile_id == Ctl.SPACE).rect.height()
     board = kb.geometry()
     assert board.y() >= geo.y()

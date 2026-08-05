@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import logging
 import sys
 import time
+from collections.abc import Callable, Iterable
 from enum import Enum, auto
+from typing import Final
 
 import cv2
 import numpy as np
@@ -59,22 +63,20 @@ from core.head_pose import HeadPoseMonitor
 from core.preprocessing import LIGHTING_CONDITIONS, PREPROCESSOR_FACTORIES
 from core.vision import GazeEstimator, LandmarksData, build_feature_vector
 from ui_gaze import GazeInteractionController
-from typing import Final
+
+# Status-label tints
+STATUS_OK: Final[str] = "#2ecc71"
+STATUS_WARN: Final[str] = "#e67e22"
+STATUS_BUSY: Final[str] = "#3498db"
 
 # Time without a single sample after SPACE before the overlay tells the user the
 # gaze signal has not arrived yet (for example the CNN model is still loading).
 GAZE_WAIT_HINT_S: Final[float] = 1.0
 
-# Validation targets intentionally lie off all training grids so the report
-# measures pure generalization instead of memorization. The grids place
-# anchors at {0.1, 0.5, 0.9} (5-pt, 9-pt) and at linspace(0.1, 0.9, 4)
-# (16-pt); every target below is disjoint from all of them. The central
-# target is (0.45, 0.55) and not (0.5, 0.5) on purpose: (0.5, 0.5) is a
-# training anchor of both the 5-pt and 9-pt grids, so validating on it would
-# measure memory of a fitted point rather than generalization. (0.45, 0.55)
-# probes the same central region while staying off every training grid,
-# making the edge-vs-center error contrast measurable within a single
-# session.
+# Validation targets lie off every training grid, so the report measures
+# generalization rather than memory of a fitted point. The grids anchor at
+# {0.1, 0.5, 0.9} (5-pt, 9-pt) and at linspace(0.1, 0.9, 4) (16-pt). The
+# central target is (0.45, 0.55) rather than (0.5, 0.5).
 VALIDATION_TARGETS: Final[list[NormalizedPoint]] = [
     NormalizedPoint(0.2, 0.2),
     NormalizedPoint(0.8, 0.2),
@@ -104,12 +106,9 @@ def build_strategy_vector(
     consumer: L2CSConsumer | None = None,
 ) -> list[float] | None:
     """
-    Assembles the feature vector based on the strategy's feature source.
-
-    - Geometric: Returns the PC-EC vector (optionally pose-augmented).
-    - Appearance (L2CS): Returns CNN (pitch, yaw) angles as decided by the
-      `consumer` - one sample per inference while calibrating, a continuously
-      eased value while interacting (optionally pose-augmented).
+    Assembles the feature vector the strategy's feature source calls for:
+    the PC-EC vector, or the CNN gaze angles at the pace set by `consumer`.
+    Either family appends head pose when the strategy asks for it.
     """
 
     if strategy.feature_source == FeatureSource.L2CS:
@@ -120,6 +119,8 @@ def build_strategy_vector(
 
 
 class CameraThread(QThread):
+    """Grabs webcam frames and emits them with their landmarks attached."""
+
     frame_ready = Signal(np.ndarray, LandmarksData)
 
     def __init__(self) -> None:
@@ -130,13 +131,23 @@ class CameraThread(QThread):
 
     def run(self) -> None:
         cap = cv2.VideoCapture(0)
-        while self._is_running:
-            ret, frame = cap.read()
-            if ret:
-                timestamp_ms = int((time.time_ns() - self.start_time_ns) / 1_000_000)
-                processed_frame, landmarks_data = self.estimator.process_frame(frame, timestamp_ms)
-                self.frame_ready.emit(processed_frame, landmarks_data)
-        cap.release()
+
+        if not cap.isOpened():
+            rlog.event("camera_unavailable", level=logging.ERROR)
+            cap.release()
+            return
+
+        try:
+            while self._is_running:
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+
+                timestamp_ms = (time.time_ns() - self.start_time_ns) // 1_000_000
+                processed_frame, landmarks = self.estimator.process_frame(frame, timestamp_ms)
+                self.frame_ready.emit(processed_frame, landmarks)
+        finally:
+            cap.release()
 
     def stop(self) -> None:
         self._is_running = False
@@ -156,8 +167,11 @@ class CalibrationOverlay(QWidget):
     and produces an accuracy report after the initial calibration phase.
     """
 
-    finished = Signal(CalibrationStrategy, ValidationReport)
+    finished = Signal(ValidationReport)
     aborted = Signal()
+
+    # Re-collections allowed on one scattered calibration point
+    MAX_RETRIES: Final[int] = 3
 
     def __init__(self, strategy: CalibrationStrategy, screen: QScreen) -> None:
         super().__init__()
@@ -176,12 +190,13 @@ class CalibrationOverlay(QWidget):
         self.collecting = False
         self.collect_t0 = 0.0
         self.batch: list[list[float]] = []
-        self.validation_predictions: list[list[float] | None] = []
+        self.validation_predictions: list[NormalizedPoint | None] = []
 
         # Pursuit segment state
         self.pursuit_active = False
         self.pursuit_t0 = 0.0
         self.pursuit_samples = 0
+
         self._anim = QTimer(self)
         self._anim.setInterval(16)
         self._anim.timeout.connect(self._on_anim_tick)
@@ -196,15 +211,23 @@ class CalibrationOverlay(QWidget):
         self.head_monitor: HeadPoseMonitor | None = None
 
         # Independent observations only, so batch spread stays meaningful
-        self._l2cs: L2CSConsumer = FreshSampleConsumer()
+        self._l2cs_consumer: L2CSConsumer = FreshSampleConsumer()
 
     def start(self) -> None:
         self.setGeometry(self._screen.geometry())
         self.showFullScreen()
         self.setFocus()
 
-    def _build_vec(self, data: LandmarksData) -> list[float] | None:
-        return build_strategy_vector(self.strategy, data, consumer=self._l2cs)
+    def _frame_features(self, data: LandmarksData) -> list[float] | None:
+        return build_strategy_vector(self.strategy, data, consumer=self._l2cs_consumer)
+
+    def _record_pose(self, data: LandmarksData) -> None:
+        """Feeds the chinrest reference, which is built from calibration poses."""
+
+        if data.head_pose is not None:
+            self.pose_batch.append(
+                (data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll)
+            )
 
     @Slot(np.ndarray, LandmarksData)
     def on_frame(self, frame: np.ndarray, data: LandmarksData) -> None:
@@ -212,37 +235,45 @@ class CalibrationOverlay(QWidget):
             return
 
         if self.pursuit_active:
-            self._on_pursuit_frame(frame, data)
+            self._on_pursuit_frame(data)
             return
 
         if not self.collecting:
             return
-        vec = self._build_vec(data)
+
+        vec = self._frame_features(data)
         if vec is None:
             return
+
         self.batch.append(vec)
-        if data.head_pose is not None and self.phase is Phase.CALIBRATION:
-            self.pose_batch.append((data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll))
+        if self.phase is Phase.CALIBRATION:
+            self._record_pose(data)
+
         if len(self.batch) >= self.strategy.samples_per_point:
             self._commit_point()
+
         self.update()
 
-    def _on_pursuit_frame(self, frame: np.ndarray, data: LandmarksData) -> None:
+    def _on_pursuit_frame(self, data: LandmarksData) -> None:
         segment = self._current_segment()
         elapsed = time.monotonic() - self.pursuit_t0
+
         if elapsed >= segment.duration_s:
             self._finish_pursuit(segment)
             return
+
+        # The eye trails the target, so a frame is labelled with where the
+        # target was one lag ago, and the first lag has no such position.
         if elapsed < PURSUIT_LAG_S:
             return
-        vec = self._build_vec(data)
+
+        vec = self._frame_features(data)
         if vec is None:
             return
-        label = segment.position_at(elapsed - PURSUIT_LAG_S)
-        self.strategy.add_samples(label, [vec])
+
+        self.strategy.add_samples(segment.position_at(elapsed - PURSUIT_LAG_S), [vec])
         self.pursuit_samples += 1
-        if data.head_pose is not None:
-            self.pose_batch.append((data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll))
+        self._record_pose(data)
 
     def _on_anim_tick(self) -> None:
         if self.pursuit_active:
@@ -251,43 +282,41 @@ class CalibrationOverlay(QWidget):
                 self._finish_pursuit(segment)
         self.update()
 
+    def _batch_too_scattered(self, target: NormalizedPoint) -> bool:
+        """Whether this batch should be re-collected."""
+
+        spread = calculate_sample_spread(self.batch)
+        threshold = self.strategy.spread_threshold
+        if threshold is None or spread is None or spread <= threshold:
+            self.retries = 0
+            return False
+
+        if self.retries >= self.MAX_RETRIES:
+            rlog.event("calibration_point_forced", point=[target.x, target.y],
+                       spread=spread, level=logging.WARNING)
+            self.retries = 0
+            return False
+
+        rlog.event("calibration_point_rejected", point=[target.x, target.y],
+                   spread=spread, level=logging.WARNING)
+        self.retries += 1
+        return True
+
     def _commit_point(self) -> None:
         target = self._current_target()
         self._collect_timer.stop()
+        self.collecting = False
 
         if self.phase is Phase.CALIBRATION:
-            spread = calculate_sample_spread(self.batch)
-            threshold = self.strategy.spread_threshold
-
-            if threshold is not None and spread is not None and spread > threshold:
-                if self.retries < 3:
-                    rlog.event(
-                        "calibration_point_rejected",
-                        point=[target.x, target.y],
-                        spread=spread,
-                        level=logging.WARNING,
-                    )
-                    self.retries += 1
-                    self.collecting = False
-                    self.batch = []
-                    self.update()
-                    return
-                else:
-                    rlog.event(
-                        "calibration_point_forced",
-                        point=[target.x, target.y],
-                        spread=spread,
-                        level=logging.WARNING,
-                    )
-
-            self.retries = 0
+            if self._batch_too_scattered(target):
+                self.batch = []
+                self.update()
+                return
 
             rlog.log_calibration_point(target, len(self.batch), features_batch=self.batch)
             self.strategy.add_samples(target, self.batch)
         else:
             self.validation_predictions.append(self._median_prediction(self.batch))
-
-        self.collecting = False
 
         QApplication.beep()
 
@@ -296,6 +325,7 @@ class CalibrationOverlay(QWidget):
 
         if self.point_idx >= len(self._phase_targets()):
             self._advance_segment()
+
         self.update()
 
     def _finish_pursuit(self, segment: Segment) -> None:
@@ -340,22 +370,27 @@ class CalibrationOverlay(QWidget):
         report = self._build_report()
         rlog.event(
             "validation_report",
+            summary=report.summary(),
             mean_error_px=report.mean_error_px,
             mean_error_deg=report.mean_error_deg,
             mean_error_percent=report.mean_error_percent,
             n_points=len(report.points),
             n_refused=report.n_refused or None,
         )
-        self.finished.emit(self.strategy, report)
+        self.finished.emit(report)
         self.close()
 
-    def _median_prediction(self, batch: list[list[float]]) -> list[float] | None:
-        preds = [p for p in (self.strategy.predict(vec) for vec in batch) if p is not None]
+    def _median_prediction(self, batch: list[list[float]]) -> NormalizedPoint | None:
+        """Per-axis median of a validation batch, or None when the model
+        refused every frame of it."""
+
+        preds = [p for p in map(self.strategy.predict, batch) if p is not None]
         if not preds:
             return None
+
         xs = sorted(p.x for p in preds)
         ys = sorted(p.y for p in preds)
-        return [xs[len(xs) // 2], ys[len(ys) // 2]]
+        return NormalizedPoint(xs[len(xs) // 2], ys[len(ys) // 2])
 
     def _build_report(self) -> ValidationReport:
         size_mm = self._screen.physicalSize()
@@ -365,26 +400,25 @@ class CalibrationOverlay(QWidget):
             screen_w_px=geo.width(),
             screen_h_px=geo.height(),
         )
-        for target, pred in zip(VALIDATION_TARGETS, self.validation_predictions):
-            if pred is None:
+
+        for target, prediction in zip(VALIDATION_TARGETS, self.validation_predictions):
+            if prediction is None:
                 report.n_refused += 1
-                rlog.event(
-                    "validation_point_refused",
-                    point=[target.x, target.y],
-                    level=logging.WARNING
-                )
+                rlog.event("validation_point_refused", point=[target.x, target.y],
+                           level=logging.WARNING)
                 continue
-            report.points.append(
-                compute_point_error(
-                    target,
-                    NormalizedPoint(pred[0], pred[1]),
-                    geo.width(),
-                    geo.height(),
-                    size_mm.width() or None,
-                    size_mm.height() or None,
-                )
+
+            error = compute_point_error(
+                target,
+                prediction,
+                geo.width(),
+                geo.height(),
+                size_mm.width() or None,
+                size_mm.height() or None,
             )
-            rlog.log_validation_point(target, report.points[-1].error_px, report.points[-1].error_deg)
+            report.points.append(error)
+            rlog.log_validation_point(target, error.error_px, error.error_deg)
+
         return report
 
     def _current_segment(self) -> Segment:
@@ -398,108 +432,137 @@ class CalibrationOverlay(QWidget):
     def _current_target(self) -> NormalizedPoint:
         return self._phase_targets()[self.point_idx]
 
+    def _in_pursuit_segment(self) -> bool:
+        return (
+            self.phase is Phase.CALIBRATION
+            and self._current_segment().kind is SegmentKind.PURSUIT
+        )
+
+    def _start_pursuit(self) -> None:
+        self.pursuit_active = True
+        self.pursuit_t0 = time.monotonic()
+        self.pursuit_samples = 0
+        self._anim.start()
+
+    def _start_collecting(self) -> None:
+        self.collecting = True
+        self.batch = []
+        self.collect_t0 = time.monotonic()
+        self._collect_timer.start()
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.isAutoRepeat():
             return
-        if event.key() == Qt.Key.Key_Space:
-            if self.phase is Phase.CALIBRATION and self._current_segment().kind == SegmentKind.PURSUIT:
-                if not self.pursuit_active:
-                    self.pursuit_active = True
-                    self.pursuit_t0 = time.monotonic()
-                    self.pursuit_samples = 0
-                    self._anim.start()
-                    self.update()
-            elif not self.collecting:
-                self.collecting = True
-                self.batch = []
-                self.collect_t0 = time.monotonic()
-                self._collect_timer.start()
-                self.update()
-        elif event.key() == Qt.Key.Key_Escape:
+
+        if event.key() == Qt.Key.Key_Escape:
             self.aborted.emit()
             self.close()
+            return
+
+        if event.key() != Qt.Key.Key_Space:
+            return
+
+        if self._in_pursuit_segment():
+            if not self.pursuit_active:
+                self._start_pursuit()
+                self.update()
+        elif not self.collecting:
+            self._start_collecting()
+            self.update()
+
+    def _instruction(self, pursuit: bool) -> str:
+        """The bottom-of-screen caption for the current phase."""
+
+        hold = "Look at the dot and press SPACE. Keep looking until the ring completes."
+        abort = "ESC to abort"
+
+        if self.phase is Phase.VALIDATION:
+            position = f"point {self.point_idx + 1}/{len(VALIDATION_TARGETS)}"
+            return f"VALIDATION  -  {position}   |   {hold}   |   {abort}"
+
+        if pursuit:
+            follow = (
+                "Follow the moving dot with your eyes." if self.pursuit_active
+                else "Press SPACE, then follow the moving dot with your eyes."
+            )
+            return f"CALIBRATION (pursuit)   |   {follow}   |   {abort}"
+
+        segment = f"segment {self.seg_idx + 1}/{len(self.plan)}, " if len(self.plan) > 1 else ""
+        position = f"{segment}point {self.point_idx + 1}/{len(self._phase_targets())}"
+        return f"CALIBRATION  -  {position}   |   {hold}   |   {abort}"
+
+    def _paint_target(self, painter: QPainter, center: QPoint, pursuit: bool) -> None:
+        if pursuit:
+            color = QColor(46, 204, 113)
+        elif self.phase is Phase.CALIBRATION:
+            color = QColor(52, 152, 219)
+        else:
+            color = QColor(155, 89, 182)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(center, 16, 16)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawEllipse(center, 4, 4)
+
+    def _paint_collection_ring(self, painter: QPainter, center: QPoint) -> None:
+        ring = QRect(center.x() - 26, center.y() - 26, 52, 52)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Ring visible at 0% progress so that the target feels active on SPACE presses
+        painter.setPen(QPen(QColor(70, 90, 80), 4))
+        painter.drawEllipse(ring)
+
+        painter.setPen(QPen(QColor(46, 204, 113), 4))
+        span = int(360 * 16 * len(self.batch) / self.strategy.samples_per_point)
+        painter.drawArc(ring, 90 * 16, -span)
+
+        if not self.batch and time.monotonic() - self.collect_t0 > GAZE_WAIT_HINT_S:
+            painter.setPen(QColor(150, 160, 170))
+            painter.setFont(QFont("Arial", 11))
+            painter.drawText(
+                QRect(center.x() - 140, center.y() + 34, 280, 22),
+                Qt.AlignmentFlag.AlignCenter,
+                "waiting for gaze signal...",
+            )
 
     def paintEvent(self, _event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        pursuit = self.phase is Phase.CALIBRATION and self._current_segment().kind == SegmentKind.PURSUIT
+        pursuit = self._in_pursuit_segment()
+        segment = self._current_segment()
+        elapsed = time.monotonic() - self.pursuit_t0 if self.pursuit_active else 0.0
 
-        if pursuit:
-            segment = self._current_segment()
-            elapsed = (time.monotonic() - self.pursuit_t0) if self.pursuit_active else 0.0
-            target = segment.position_at(elapsed)
-        else:
-            target = self._current_target()
-        cx, cy = int(target.x * w), int(target.y * h)
+        target = segment.position_at(elapsed) if pursuit else self._current_target()
+        center = QPoint(int(target.x * w), int(target.y * h))
 
-        color = QColor(52, 152, 219) if self.phase is Phase.CALIBRATION else QColor(155, 89, 182)
-        if pursuit:
-            color = QColor(46, 204, 113)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
-        painter.drawEllipse(QPoint(cx, cy), 16, 16)
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(QPoint(cx, cy), 4, 4)
+        self._paint_target(painter, center, pursuit)
 
         if self.collecting and not pursuit:
-            ring_rect = QRect(cx - 26, cy - 26, 52, 52)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-
-            # Ring visible at 0% progress so that the target feels active on SPACE presses
-            track = QPen(QColor(70, 90, 80))
-            track.setWidth(4)
-            painter.setPen(track)
-            painter.drawEllipse(ring_rect)
-
-            pen = QPen(QColor(46, 204, 113))
-            pen.setWidth(4)
-            painter.setPen(pen)
-            span = int(360 * 16 * len(self.batch) / self.strategy.samples_per_point)
-            painter.drawArc(ring_rect, 90 * 16, -span)
-            if not self.batch and (time.monotonic() - self.collect_t0) > GAZE_WAIT_HINT_S:
-                painter.setPen(QColor(150, 160, 170))
-                painter.setFont(QFont("Arial", 11))
-                painter.drawText(
-                    QRect(cx - 140, cy + 34, 280, 22),
-                    Qt.AlignmentFlag.AlignCenter,
-                    "waiting for gaze signal...",
-                )
+            self._paint_collection_ring(painter, center)
 
         if pursuit and self.pursuit_active:
-            segment = self._current_segment()
-            frac = min((time.monotonic() - self.pursuit_t0) / segment.duration_s, 1.0)
+            done = min(elapsed / segment.duration_s, 1.0)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(46, 204, 113))
-            painter.drawRect(0, h - 8, int(w * frac), 8)
+            painter.drawRect(0, h - 8, int(w * done), 8)
 
         painter.setPen(QColor(220, 220, 220))
         painter.setFont(QFont("Arial", 14))
-        if self.phase is Phase.VALIDATION:
-            msg = (
-                f"VALIDATION  -  point {self.point_idx + 1}/{len(VALIDATION_TARGETS)}   |   "
-                "Look at the dot and press SPACE. Keep looking until the ring completes.   |   ESC to abort"
-            )
-        elif pursuit:
-            msg = (
-                "CALIBRATION (pursuit)   |   "
-                + ("Follow the moving dot with your eyes." if self.pursuit_active
-                 else "Press SPACE, then FOLLOW the moving dot with your eyes.")
-                + "   |   ESC to abort"
-            )
-        else:
-            total = len(self._phase_targets())
-            seg_info = f"segment {self.seg_idx + 1}/{len(self.plan)}, " if len(self.plan) > 1 else ""
-            msg = (
-                f"CALIBRATION  -  {seg_info}point {self.point_idx + 1}/{total}   |   "
-                "Look at the dot and press SPACE. Keep looking until the ring completes.   |   ESC to abort"
-            )
-        painter.drawText(QRect(0, h - 60, w, 40), Qt.AlignmentFlag.AlignCenter, msg)
+        painter.drawText(
+            QRect(0, h - 60, w, 40),
+            Qt.AlignmentFlag.AlignCenter,
+            self._instruction(pursuit),
+        )
         painter.end()
 
 
 class MainWindow(QMainWindow):
+    """Camera preview, run configuration, and the entry points into
+    calibration and gaze mode."""
+
     def __init__(self, screen: QScreen) -> None:
         super().__init__()
         self.setWindowTitle("Vistea")
@@ -514,76 +577,40 @@ class MainWindow(QMainWindow):
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(self.video_label, stretch=1)
 
-        self.status_label = QLabel("Choose a strategy and start calibration.")
+        self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
         main_layout.addWidget(self.status_label)
+        self._set_status("Choose a strategy and start calibration.")
 
         controls = QHBoxLayout()
         controls.setSpacing(10)
 
-        lbl_strategy = QLabel("Strategy:")
-        lbl_strategy.setStyleSheet("font-weight: bold;")
-        controls.addWidget(lbl_strategy)
-
-        self.strategy_box = QComboBox()
-        self.strategy_box.addItems(STRATEGY_REGISTRY.keys())
+        self.strategy_box = self._add_combo(
+            controls, "Strategy:", STRATEGY_REGISTRY.keys(), stretch=2
+        )
         self.strategy_box.setCurrentText(DEFAULT_STRATEGY_KEY)
-        self.strategy_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.strategy_box.currentTextChanged.connect(self._on_strategy_changed)
-        controls.addWidget(self.strategy_box, stretch=2)
 
-        lbl_lighting = QLabel("Lighting:")
-        lbl_lighting.setStyleSheet("font-weight: bold;")
-        controls.addWidget(lbl_lighting)
-
-        self.lighting_box = QComboBox()
-        self.lighting_box.addItems(LIGHTING_CONDITIONS)
-        self.lighting_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        controls.addWidget(self.lighting_box, stretch=1)
-
-        lbl_prep = QLabel("Preprocessing:")
-        lbl_prep.setStyleSheet("font-weight: bold;")
-        controls.addWidget(lbl_prep)
-
-        self.prep_box = QComboBox()
-        self.prep_box.addItems(PREPROCESSOR_FACTORIES.keys())
-        self.prep_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        controls.addWidget(self.prep_box, stretch=2)
-
-        lbl_activation = QLabel("Activation:")
-        lbl_activation.setStyleSheet("font-weight: bold;")
-        controls.addWidget(lbl_activation)
-
-        self.activation_box = QComboBox()
-        self.activation_box.addItems(ACTIVATION_REGISTRY.keys())
-        self.activation_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        controls.addWidget(self.activation_box, stretch=2)
-
-        self.btn_calibrate = QPushButton("Start Calibration")
-        self.btn_calibrate.setStyleSheet(
-            "background-color: #2980b9; color: white; font-weight: bold; padding: 10px;"
+        self.lighting_box = self._add_combo(
+            controls, "Lighting:", LIGHTING_CONDITIONS, stretch=1
         )
-        self.btn_calibrate.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_calibrate.clicked.connect(self.start_calibration)
-        controls.addWidget(self.btn_calibrate)
-
-        self.btn_gaze = QPushButton("Gaze Mode")
-        self.btn_gaze.setStyleSheet(
-            "background-color: #27ae60; color: white; font-weight: bold; padding: 10px;"
+        self.prep_box = self._add_combo(
+            controls, "Preprocessing:", PREPROCESSOR_FACTORIES.keys(), stretch=2
         )
-        self.btn_gaze.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_gaze.setEnabled(False) # requires a calibrated model
-        self.btn_gaze.clicked.connect(self.start_gaze_mode)
-        controls.addWidget(self.btn_gaze)
-
-        self.btn_reset = QPushButton("Reset")
-        self.btn_reset.setStyleSheet(
-            "background-color: #e74c3c; color: white; font-weight: bold; padding: 10px;"
+        self.activation_box = self._add_combo(
+            controls, "Activation:", ACTIVATION_REGISTRY.keys(), stretch=2
         )
-        self.btn_reset.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_reset.clicked.connect(self.reset_calibration)
-        controls.addWidget(self.btn_reset)
+
+        self.btn_calibrate = self._add_button(
+            controls, "Start Calibration", "#2980b9", self.start_calibration
+        )
+        self.btn_gaze = self._add_button(
+            controls, "Gaze Mode", "#27ae60", self.start_gaze_mode
+        )
+        self.btn_gaze.setEnabled(False)  # Requires a calibrated model
+        self.btn_reset = self._add_button(
+            controls, "Reset", "#e74c3c", self.reset_calibration
+        )
 
         main_layout.addLayout(controls)
 
@@ -609,29 +636,63 @@ class MainWindow(QMainWindow):
         self.lighting_box.currentTextChanged.connect(
             lambda name: rlog.bind(lighting_condition=name)
         )
+        self.prep_box.currentTextChanged.connect(self._swap_preprocessor)
 
-        def _swap_prep(label: str) -> None:
-            prep = PREPROCESSOR_FACTORIES[label]()
-            self.camera_thread.estimator.preprocessor = prep
-            rlog.bind(preprocessing=prep.name)
-            
-        self.prep_box.currentTextChanged.connect(_swap_prep)
-        
-        _swap_prep(self.prep_box.currentText())
+        self._swap_preprocessor(self.prep_box.currentText())
         rlog.bind(lighting_condition=self.lighting_box.currentText())
+
+    @staticmethod
+    def _add_combo(
+        row: QHBoxLayout, caption: str, items: Iterable[str], stretch: int
+    ) -> QComboBox:
+        """Appends a caption and its unfocusable selector to the row."""
+
+        label = QLabel(caption)
+        label.setStyleSheet("font-weight: bold;")
+        row.addWidget(label)
+
+        box = QComboBox()
+        box.addItems(items)
+        box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        row.addWidget(box, stretch=stretch)
+        return box
+
+    @staticmethod
+    def _add_button(
+        row: QHBoxLayout, text: str, color: str, on_click: Callable[[], None]
+    ) -> QPushButton:
+        """Appends an action button. Focus is refused throughout the row so the
+        keyboard never steals it from the application being driven."""
+
+        button = QPushButton(text)
+        button.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold; padding: 10px;"
+        )
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(on_click)
+        row.addWidget(button)
+        return button
+
+    def _set_status(self, text: str, color: str | None = None) -> None:
+        """Single point of truth for the status line, tint included."""
+
+        tint = f"color: {color}; " if color is not None else ""
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"font-size: {16 if color is None else 15}px; font-weight: bold; {tint}padding: 8px;"
+        )
+
+    def _swap_preprocessor(self, label: str) -> None:
+        preprocessor = PREPROCESSOR_FACTORIES[label]()
+        self.camera_thread.estimator.preprocessor = preprocessor
+        rlog.bind(preprocessing=preprocessor.name)
 
     def _on_strategy_changed(self, key: str) -> None:
         factory = STRATEGY_REGISTRY.get(key)
-        if factory is None:
+        if factory is None or factory().feature_source != FeatureSource.L2CS:
             return
-        candidate = factory()
-
-        if candidate.feature_source != FeatureSource.L2CS:
-            return
-
-        if not l2cs_available():
-            return
-        _get_l2cs_worker().warmup()
+        if l2cs_available():
+            _get_l2cs_worker().warmup()
 
     def start_calibration(self) -> None:
         strategy_factory = STRATEGY_REGISTRY[self.strategy_box.currentText()]
@@ -639,13 +700,11 @@ class MainWindow(QMainWindow):
 
         is_l2cs = candidate.feature_source == FeatureSource.L2CS
         if is_l2cs and not l2cs_available():
-            self.status_label.setText(
+            self._set_status(
                 "L2CS-Net unavailable: install the CNN extras "
                 "(`uv sync --group cnn`) and place the weights - see "
-                "models/README_L2CS.md."
-            )
-            self.status_label.setStyleSheet(
-                "font-size: 15px; font-weight: bold; color: #e67e22; padding: 8px;"
+                "models/README_L2CS.md.",
+                STATUS_WARN,
             )
             return
 
@@ -660,11 +719,9 @@ class MainWindow(QMainWindow):
 
         if is_l2cs:
             self._l2cs_status_state = None
-            self.status_label.setText(
-                "CNN model loads in the background - samples will flow in a few seconds."
-            )
-            self.status_label.setStyleSheet(
-                "font-size: 15px; font-weight: bold; color: #3498db; padding: 8px;"
+            self._set_status(
+                "CNN model loads in the background - samples will flow in a few seconds.",
+                STATUS_BUSY,
             )
 
         rlog.bind(
@@ -681,20 +738,13 @@ class MainWindow(QMainWindow):
         self.overlay.aborted.connect(self.on_calibration_aborted)
         self.overlay.start()
 
-    @Slot(CalibrationStrategy, ValidationReport)
-    def on_calibration_finished(self, strategy: CalibrationStrategy, report: ValidationReport) -> None:
+    @Slot(ValidationReport)
+    def on_calibration_finished(self, report: ValidationReport) -> None:
         if self.overlay is not None:
             self.head_monitor = self.overlay.head_monitor
         self._detach_overlay()
-        summary = report.summary()
-        print(summary)
-        for pt in report.points:
-            deg = f", {pt.error_deg:.2f} deg" if pt.error_deg is not None else ""
-            print(f"  target ({pt.target.x:.1f}, {pt.target.y:.1f}) -> error {pt.error_px:.0f} px{deg}")
-        self.status_label.setText(summary)
-        self.status_label.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #2ecc71; padding: 8px;"
-        )
+
+        self._set_status(report.summary(), STATUS_OK)
         self.mean_error_px = report.mean_error_px
         self.btn_gaze.setEnabled(True)
 
@@ -702,7 +752,7 @@ class MainWindow(QMainWindow):
     def on_calibration_aborted(self) -> None:
         self._detach_overlay()
         self.strategy = None
-        self.status_label.setText("Calibration aborted.")
+        self._set_status("Calibration aborted.")
 
     def _detach_overlay(self) -> None:
         if self.overlay is not None:
@@ -718,8 +768,7 @@ class MainWindow(QMainWindow):
         self.mean_error_px = None
         self.btn_gaze.setEnabled(False)
         self.gaze_filter.reset()
-        self.status_label.setText("Calibration cleared. Choose a strategy and start calibration.")
-        self.status_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
+        self._set_status("Calibration cleared. Choose a strategy and start calibration.")
 
     def start_gaze_mode(self) -> None:
         if self.strategy is None or not self.strategy.is_calibrated():
@@ -748,7 +797,7 @@ class MainWindow(QMainWindow):
         self.showMaximized()
         self.raise_()
         self.activateWindow()
-        self.status_label.setText("Gaze mode closed. You can recalibrate or start it again.")
+        self._set_status("Gaze mode closed. You can recalibrate or start it again.")
 
     def _check_head_pose(self, data: LandmarksData) -> bool:
         """Virtual chinrest: freeze the cursor and warn while the head has
@@ -756,12 +805,14 @@ class MainWindow(QMainWindow):
 
         if self.head_monitor is None or data.head_pose is None:
             return True
+
         state = self.head_monitor.update(
             data.head_pose.yaw, data.head_pose.pitch, data.head_pose.roll
         )
+
         if not state.ok:
             if self._pose_ok or self.head_monitor.should_warn():
-                axis, dev = state.worst_axis()
+                axis, deviation = state.worst_axis()
                 rlog.event(
                     "head_pose_drift",
                     dyaw_deg=round(state.dyaw_deg, 1),
@@ -769,101 +820,116 @@ class MainWindow(QMainWindow):
                     droll_deg=round(state.droll_deg, 1),
                     level=logging.WARNING,
                 )
-                self.status_label.setText(
-                    f"Head moved from calibration pose ({axis} {dev:+.0f} deg) - "
-                    "return to position or recalibrate."
-                )
-                self.status_label.setStyleSheet(
-                    "font-size: 15px; font-weight: bold; color: #e67e22; padding: 8px;"
+                self._set_status(
+                    f"Head moved from calibration pose ({axis} {deviation:+.0f} deg) - "
+                    "return to position or recalibrate.",
+                    STATUS_WARN,
                 )
             if self._pose_ok and self.gaze_controller is not None:
                 self.gaze_controller.notify("Head out of calibration pose", "warning")
                 self.gaze_controller.note_pose_drift()
             self._pose_ok = False
+
         elif not self._pose_ok:
             self._pose_ok = True
-            self.status_label.setText("Head pose OK.")
-            self.status_label.setStyleSheet(
-                "font-size: 15px; font-weight: bold; color: #2ecc71; padding: 8px;"
-            )
+            self._set_status("Head pose OK.", STATUS_OK)
             if self.gaze_controller is not None:
                 self.gaze_controller.notify("Head pose OK", "info")
+
         return state.ok
 
     def _update_l2cs_status(self) -> None:
-        """Reflect the background CNN's lifecycle in the status label."""
+        """
+        Reflect the background CNN's lifecycle in the status label,
+        once per transition.
+        """
 
         if self.strategy is None or self.strategy.feature_source != FeatureSource.L2CS:
             return
         if _l2cs_worker is None:
             return
+
         state = _l2cs_worker.state
         if state == self._l2cs_status_state:
             return
         self._l2cs_status_state = state
+
         if state == "ready":
-            self.status_label.setText("CNN model ready - collecting samples.")
-            self.status_label.setStyleSheet(
-                "font-size: 15px; font-weight: bold; color: #2ecc71; padding: 8px;"
-            )
+            self._set_status("CNN model ready - collecting samples.", STATUS_OK)
         elif state == "failed":
-            self.status_label.setText(
-                "CNN model failed to load - see the log and pick another strategy."
-            )
-            self.status_label.setStyleSheet(
-                "font-size: 15px; font-weight: bold; color: #e67e22; padding: 8px;"
+            self._set_status(
+                "CNN model failed to load - see the log and pick another strategy.",
+                STATUS_WARN,
             )
 
-    @Slot(np.ndarray, LandmarksData)
-    def update_ui(self, frame: np.ndarray, data: LandmarksData) -> None:
-        pose_ok = self._check_head_pose(data)
-        self._update_l2cs_status()
-        vec = None
-        if (
-            self.strategy is not None
-            and self.strategy.is_calibrated()
-            and data.gaze_valid
-        ):
-            vec = build_strategy_vector(self.strategy, data, consumer=self._l2cs_stream)
-            # Cursor paused while the head has drifted, and while a lid is in motion
-            if vec is not None and pose_ok and data.lids_stable:
-                raw = self.strategy.predict(vec)
-                if raw is None:
-                    self.latest_gaze = None
-                else:
-                    fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
-                    self.latest_gaze = NormalizedPoint(fx, fy)
+    def _is_calibrated(self) -> bool:
+        return self.strategy is not None and self.strategy.is_calibrated()
 
-        if self.gaze_controller is not None:
-            # Withholding the gaze point (rather than passing a stale one) freezes
-            # dwell progress instead of accumulating it on a mislocated target.
-            gaze = self.latest_gaze if (pose_ok and data.lids_stable) else None
-            self.gaze_controller.on_gaze(gaze, data, vec)
+    def _track_gaze(self, data: LandmarksData, pose_ok: bool) -> list[float] | None:
+        if self.strategy is None or not self._is_calibrated() or not data.gaze_valid:
+            return None
+
+        vec = build_strategy_vector(self.strategy, data, consumer=self._l2cs_stream)
+
+        # Cursor paused while the head has drifted, and while a lid is in motion
+        if vec is None or not pose_ok or not data.lids_stable:
+            return vec
+
+        raw = self.strategy.predict(vec)
+        if raw is None:
+            self.latest_gaze = None
+        else:
+            fx, fy = self.gaze_filter.filter((raw.x, raw.y), data.timestamp_ms)
+            self.latest_gaze = NormalizedPoint(fx, fy)
+
+        return vec
+
+    def _render_preview(self, frame: np.ndarray) -> None:
+        """Draw the camera frame into the window, with a crosshair on the
+        current estimate."""
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_rgb.shape
-        pixmap = QPixmap.fromImage(QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888))
+        h, w, channels = frame_rgb.shape
+        pixmap = QPixmap.fromImage(
+            QImage(frame_rgb.data, w, h, channels * w, QImage.Format.Format_RGB888)
+        )
         scaled = pixmap.scaled(
             self.video_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
 
-        if self.latest_gaze is not None and self.strategy is not None and self.strategy.is_calibrated():
-            painter = QPainter(scaled)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            pen = QPen(QColor(255, 0, 0))
-            pen.setWidth(4)
-            painter.setPen(pen)
-            gx = int(min(1.0, max(0.0, self.latest_gaze.x)) * scaled.width())
-            gy = int(min(1.0, max(0.0, self.latest_gaze.y)) * scaled.height())
-            radius = 12
-            painter.drawEllipse(QPoint(gx, gy), radius, radius)
-            painter.drawLine(gx - radius - 5, gy, gx + radius + 5, gy)
-            painter.drawLine(gx, gy - radius - 5, gx, gy + radius + 5)
-            painter.end()
+        if self.latest_gaze is not None and self._is_calibrated():
+            self._draw_crosshair(scaled, self.latest_gaze)
 
         self.video_label.setPixmap(scaled)
+
+    @staticmethod
+    def _draw_crosshair(pixmap: QPixmap, gaze: NormalizedPoint) -> None:
+        x = int(min(1.0, max(0.0, gaze.x)) * pixmap.width())
+        y = int(min(1.0, max(0.0, gaze.y)) * pixmap.height())
+        radius = 12
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(255, 0, 0), 4))
+        painter.drawEllipse(QPoint(x, y), radius, radius)
+        painter.drawLine(x - radius - 5, y, x + radius + 5, y)
+        painter.drawLine(x, y - radius - 5, x, y + radius + 5)
+        painter.end()
+
+    @Slot(np.ndarray, LandmarksData)
+    def update_ui(self, frame: np.ndarray, data: LandmarksData) -> None:
+        pose_ok = self._check_head_pose(data)
+        self._update_l2cs_status()
+
+        vec = self._track_gaze(data, pose_ok)
+
+        if self.gaze_controller is not None:
+            gaze = self.latest_gaze if (pose_ok and data.lids_stable) else None
+            self.gaze_controller.on_gaze(gaze, data, vec)
+
+        self._render_preview(frame)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.stop_gaze_mode()

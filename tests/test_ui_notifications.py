@@ -52,7 +52,7 @@ def test_expired_toasts_are_pruned(overlay: GazeOverlay) -> None:
     assert len(overlay._toasts) == 1
 
     toast = overlay._toasts[0]
-    overlay._toasts[0] = ToastMessage(text=toast.text, level=toast.level, expiry=0.0)
+    overlay._toasts[0] = ToastMessage(text=toast.text, level=toast.level, expiry_s=0.0)
 
     overlay._prune_toasts()
     assert overlay._toasts == []
@@ -69,7 +69,7 @@ def test_floor_unmet_changed_emitted_on_state_change() -> None:
     received = []
     kb.floor_unmet_changed.connect(received.append)
     kb.min_tile_px = 400
-    kb._layout_tiles()
+    kb.relayout()
     assert True in received
 
 
@@ -77,5 +77,5 @@ def test_floor_unmet_changed_not_emitted_when_state_unchanged() -> None:
     kb = KeyboardWindow(FakeScreen(), 80) # type: ignore
     received = []
     kb.floor_unmet_changed.connect(received.append)
-    kb._layout_tiles() # relayout without changing the floor state
+    kb.relayout()
     assert received == []
