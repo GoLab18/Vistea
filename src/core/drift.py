@@ -42,6 +42,7 @@ class DriftResult:
     pre_error_norm: float
     post_error_norm: float
     mean_prediction: NormalizedPoint
+    spread_norm: float
 
 
 class DriftCorrector:
@@ -134,7 +135,8 @@ class DriftCorrector:
         if len(predictions) < self.frames_per_activation:
             return None
 
-        if self._spread(predictions) > self.MAX_PREDICTION_SPREAD:
+        spread = self._spread(predictions)
+        if spread > self.MAX_PREDICTION_SPREAD:
             self.rejected += 1
             self._buffer.clear()
             return None
@@ -162,7 +164,9 @@ class DriftCorrector:
         self.corrections_applied += 1
         self._buffer.clear()
 
-        return DriftResult(len(train_frames), pre_error_norm, post_error_norm, mean_prediction)
+        return DriftResult(
+            len(train_frames), pre_error_norm, post_error_norm, mean_prediction, spread
+        )
 
 
 class PoseResidualCorrector:

@@ -282,10 +282,9 @@ class CalibrationOverlay(QWidget):
                 self._finish_pursuit(segment)
         self.update()
 
-    def _batch_too_scattered(self, target: NormalizedPoint) -> bool:
+    def _batch_too_scattered(self, target: NormalizedPoint, spread: float | None) -> bool:
         """Whether this batch should be re-collected."""
 
-        spread = calculate_sample_spread(self.batch)
         threshold = self.strategy.spread_threshold
         if threshold is None or spread is None or spread <= threshold:
             self.retries = 0
@@ -308,12 +307,16 @@ class CalibrationOverlay(QWidget):
         self.collecting = False
 
         if self.phase is Phase.CALIBRATION:
-            if self._batch_too_scattered(target):
+            spread = calculate_sample_spread(self.batch)
+
+            if self._batch_too_scattered(target, spread):
                 self.batch = []
                 self.update()
                 return
 
-            rlog.log_calibration_point(target, len(self.batch), features_batch=self.batch)
+            rlog.log_calibration_point(
+                target, len(self.batch), spread=spread, features_batch=self.batch
+            )
             self.strategy.add_samples(target, self.batch)
         else:
             self.validation_predictions.append(self._median_prediction(self.batch))
@@ -375,7 +378,7 @@ class CalibrationOverlay(QWidget):
             mean_error_deg=report.mean_error_deg,
             mean_error_percent=report.mean_error_percent,
             n_points=len(report.points),
-            n_refused=report.n_refused or None,
+            n_refused=report.n_refused,
         )
         self.finished.emit(report)
         self.close()

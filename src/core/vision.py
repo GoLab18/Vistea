@@ -124,7 +124,7 @@ def decompose_head_pose(transform_matrix: np.ndarray) -> HeadPose | None:
         return None
     r = m[:3, :3]
 
-    # Guard against a non-rotation block.
+    # Guard against a non-rotation block
     if not np.all(np.isfinite(r)):
         return None
 

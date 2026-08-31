@@ -70,8 +70,7 @@ class IDTFixationDetector:
 
     def update(self, x: float | None, y: float | None, t: float) -> FixationState:
         if x is None or y is None:
-            # Blink / lost gaze: hold the window but report non-fixating.
-            # Dwell logic applies its own grace period downstream.
+            # A blink or a lost gaze: hold the window but report non-fixating
             if self._window and t - self._window[-1][0] > self.gap_reset:
                 self.reset()
             return FixationState(False, None, 0.0, 0.0)

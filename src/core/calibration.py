@@ -455,13 +455,6 @@ STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
     "Hybrid + pose": lambda: _configure(
         HybridCalibration(use_head_pose=True), name="hybrid_9pt_pursuit_pose"
     ),
-
-    # Appearance family: L2CS emits gaze angles in RADIANS, so the PC-EC
-    # capture budget does not transfer - neither the sample count nor the
-    # spread threshold, which is a property of the feature space rather than
-    # of the application. 20 unique predictions are affordable now that the
-    # network runs at its native input size, and 0.08 rad (~4.6 deg) remains
-    # the starting point for the spread gate, to be tuned from logs.
     "L2CS-Net + linear (CNN)": lambda: _configure(
         PolynomialRidgeCalibration(grid=make_grid(3), degree=1, alpha=1e-4),
         name="l2cs_linear",

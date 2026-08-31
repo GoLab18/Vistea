@@ -1012,6 +1012,7 @@ class KeyboardMode:
             rejected=self._drift.rejected,
             pre_error_norm=round(result.pre_error_norm, 5),
             post_error_norm=round(result.post_error_norm, 5),
+            spread_norm=round(result.spread_norm, 5),
         )
 
     def _type(self, text: str) -> None:
