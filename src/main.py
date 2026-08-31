@@ -358,7 +358,7 @@ class CalibrationOverlay(QWidget):
         rlog.event(
             "calibration_trained",
             n_points=len(self.strategy.target_sequence()),
-            n_samples=self.strategy.sample_count or None,
+            n_samples=self.strategy.sample_count,
         )
 
         monitor = HeadPoseMonitor()
