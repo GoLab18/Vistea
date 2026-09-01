@@ -427,13 +427,13 @@ def _configure(
     return strategy
 
 
-DEFAULT_STRATEGY_KEY: Final[str] = "Ridge 9-pt + pose (default)"
+DEFAULT_STRATEGY_KEY: Final[str] = "Ridge 9-pt (default)"
 
 STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
     "Ridge 5-pt": lambda: _configure(
         PolynomialRidgeCalibration(grid=make_5point()), name="ridge_poly2_5pt"
     ),
-    "Ridge 9-pt": lambda: _configure(
+    DEFAULT_STRATEGY_KEY: lambda: _configure(
         PolynomialRidgeCalibration(grid=make_grid(3)), name="ridge_poly2_9pt"
     ),
     "Ridge 16-pt": lambda: _configure(
@@ -448,7 +448,7 @@ STRATEGY_REGISTRY: dict[str, Callable[[], CalibrationStrategy]] = {
     ),
     "Smooth Pursuit (24 s)": lambda: SmoothPursuitCalibration(),
     "Hybrid 9-pt + Pursuit": lambda: HybridCalibration(),
-    DEFAULT_STRATEGY_KEY: lambda: _configure(
+    "Ridge 9-pt + pose": lambda: _configure(
         PolynomialRidgeCalibration(grid=make_grid(3), use_head_pose=True),
         name="ridge_poly2_9pt_pose",
     ),
